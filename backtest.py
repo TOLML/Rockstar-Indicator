@@ -126,17 +126,18 @@ class HierarchicalMomentumStrategy:
     }
 
     def __init__(self, sensitivity=4, st_period=14, st_mult=3.0,
-                 use_drawdown_ctrl=True, max_drawdown_pct=12.0,
-                 commission_pct=0.1, slippage_pct=0.05):
+                 use_drawdown_ctrl=True, max_drawdown_pct=15.0,
+                 min_hold_bars=5, commission_pct=0.1, slippage_pct=0.05):
         self.sensitivity = sensitivity
         thresh_mult, cool_mult = self.SENSITIVITY[sensitivity]
         self.thresh_mult = thresh_mult
-        self.base_cooldown = 8
-        self.cooldown = max(2, round(self.base_cooldown * cool_mult))
+        self.base_cooldown = 12  # Increased from 8 to reduce whipsaw
+        self.cooldown = max(3, round(self.base_cooldown * cool_mult))
         self.st_period = st_period
         self.st_mult = st_mult
         self.use_drawdown_ctrl = use_drawdown_ctrl
         self.max_drawdown_pct = max_drawdown_pct
+        self.min_hold_bars = min_hold_bars  # Minimum bars before Supertrend can exit
         self.commission_pct = commission_pct
         self.slippage_pct = slippage_pct
 
@@ -239,8 +240,25 @@ class HierarchicalMomentumStrategy:
         squeeze_score = squeeze_score.where(~(squeeze_release & (deviation < 0) & (squeeze_score == 0)), -1.0)
         squeeze_score = squeeze_score.where(~(squeeze_confirmed & (squeeze_score == 0)), 0.25)
 
-        # Supertrend
-        st_value, st_direction = calc_supertrend(high, low, close, self.st_period, self.st_mult)
+        # Supertrend — auto-scale multiplier based on ATR percentile
+        # Low-vol assets (SPY) get wider multiplier to avoid whipsaw
+        # High-vol assets (BTC) get tighter multiplier for faster reaction
+        median_atr_pct = atr_pct.rolling(252, min_periods=50).median()
+        # Scale: if median ATR% < 1.0 (low vol like SPY), widen to 4-5x
+        # If median ATR% > 3.0 (high vol like BTC), keep at base 3x
+        st_mult_auto = pd.Series(self.st_mult, index=df.index)
+        for i in range(n):
+            m = median_atr_pct.iloc[i] if not pd.isna(median_atr_pct.iloc[i]) else 2.0
+            if m < 0.8:
+                st_mult_auto.iloc[i] = self.st_mult + 2.0  # Very low vol: +2
+            elif m < 1.5:
+                st_mult_auto.iloc[i] = self.st_mult + 1.0  # Low vol: +1
+            elif m > 4.0:
+                st_mult_auto.iloc[i] = max(2.0, self.st_mult - 0.5)  # Very high vol: tighter
+
+        # Use the median auto-scaled multiplier for Supertrend
+        effective_st_mult = st_mult_auto.median()
+        st_value, st_direction = calc_supertrend(high, low, close, self.st_period, effective_st_mult)
         st_bullish = st_direction > 0
         st_score = pd.Series(np.where(st_bullish, 0.5, -0.5), index=df.index)
 
@@ -284,6 +302,7 @@ class HierarchicalMomentumStrategy:
         signals = pd.Series(0, index=df.index)
         bars_since = 999
         last_dir = 0
+        bars_in_trade = 0  # Track how long we've been in current trade
 
         peak_equity = 1.0
         equity = 1.0
@@ -291,6 +310,8 @@ class HierarchicalMomentumStrategy:
 
         for i in range(1, n):
             bars_since += 1
+            if in_position:
+                bars_in_trade += 1
             cooldown_met = bars_since >= self.cooldown
             score = composite.iloc[i]
 
@@ -300,14 +321,21 @@ class HierarchicalMomentumStrategy:
             is_strong_sell = score < self.zone_distribute
 
             buy_sig = (is_strong_buy or is_accumulate) and cooldown_met and last_dir != 1
-            sell_sig = (is_distribute or is_strong_sell) and cooldown_met and last_dir != -1
+            sell_sig = False
+
+            # Score-based sell: only exit when BOTH score drops AND trend gate fails
+            # This prevents premature exits when score dips but trend is intact
+            trend_failed = not trend_gate.iloc[i] if not pd.isna(trend_gate.iloc[i]) else False
+            if (is_strong_sell and trend_failed) and last_dir != -1:
+                sell_sig = True
+
+            # Supertrend trailing stop — only after minimum hold period
+            st_exit = (st_direction.iloc[i] < 0 and last_dir == 1 and
+                       bars_in_trade >= self.min_hold_bars)
 
             # Volume gate
             if not volume_adequate.iloc[i]:
                 buy_sig = False
-
-            # Supertrend trailing stop
-            st_exit = st_direction.iloc[i] < 0 and last_dir == 1
 
             # Prevent simultaneous
             buy_sig = buy_sig and not sell_sig
@@ -332,6 +360,7 @@ class HierarchicalMomentumStrategy:
                 signals.iloc[i] = 1
                 last_dir = 1
                 bars_since = 0
+                bars_in_trade = 0
                 if not in_position:
                     in_position = True
                     equity = 1.0
@@ -340,6 +369,7 @@ class HierarchicalMomentumStrategy:
                 signals.iloc[i] = -1
                 last_dir = -1
                 bars_since = 0
+                bars_in_trade = 0
                 in_position = False
 
         return signals, composite, {

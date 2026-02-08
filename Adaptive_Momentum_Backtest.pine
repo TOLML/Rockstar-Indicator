@@ -57,14 +57,17 @@ sensCooldownMult = sensLevel == 1 ? 2.0 : sensLevel == 2 ? 1.5 : sensLevel == 3 
 // Strategy settings
 enableShorts = input.bool(false, "Enable Short Trades", group = "Strategy")
 forwardBars  = input.int(13, "Hit Rate Forward Bars (N)", minval = 1, maxval = 52, group = "Strategy")
+minHoldBars  = input.int(5, "Min Hold Period (bars)", minval = 1, maxval = 20, group = "Strategy",
+     tooltip = "Minimum bars in position before Supertrend can trigger exit.\nPrevents short whipsaw trades that lose money.")
 
 // Supertrend settings
-stAtrPeriod = input.int(14, "Supertrend ATR Period", minval = 7, maxval = 21, group = "Supertrend")
-stMultiplier = input.float(3.0, "Supertrend Multiplier", minval = 2.0, maxval = 5.0, step = 0.5, group = "Supertrend")
+stAtrPeriod  = input.int(14, "Supertrend ATR Period", minval = 7, maxval = 21, group = "Supertrend")
+stMultiplier = input.float(3.0, "Supertrend Base Multiplier", minval = 2.0, maxval = 5.0, step = 0.5, group = "Supertrend",
+     tooltip = "Auto-scales based on asset volatility.\nLow-vol assets (equities) get wider stops.\nHigh-vol assets (crypto) keep tighter stops.")
 
 // Drawdown control
 useDrawdownCtrl = input.bool(true, "Drawdown Control", group = "Risk")
-maxDrawdownPct  = input.float(12.0, "Max Drawdown %", minval = 5.0, maxval = 30.0, group = "Risk")
+maxDrawdownPct  = input.float(15.0, "Max Drawdown %", minval = 5.0, maxval = 30.0, group = "Risk")
 
 // ═══════════════════════════════════════════
 // § 2 — CORE INDICATOR CALCULATIONS
@@ -74,8 +77,17 @@ maxDrawdownPct  = input.float(12.0, "Max Drawdown %", minval = 5.0, maxval = 30.
 sma200 = ta.sma(close, 200)
 trendGatePass = close > sma200
 
+// --- ATR (needed for Supertrend auto-scaling and volatility regime) ---
+atrVal = ta.atr(14)
+atrPct = atrVal / math.max(close, 0.0001) * 100
+
 // --- Supertrend (trailing stop / exit refinement) ---
-[stValue, stDirection] = ta.supertrend(stMultiplier, stAtrPeriod)
+// Auto-scale multiplier: low-vol assets (equities) need wider stops
+// to avoid whipsaw; high-vol assets (crypto) can use tighter stops
+medianAtrPct = ta.percentile_linear_interpolation(atrPct, 252, 50)
+stAutoAdj = medianAtrPct < 0.8 ? 2.0 : medianAtrPct < 1.5 ? 1.0 : medianAtrPct > 4.0 ? -0.5 : 0.0
+effectiveStMult = math.max(2.0, stMultiplier + stAutoAdj)
+[stValue, stDirection] = ta.supertrend(effectiveStMult, stAtrPeriod)
 stBullish = stDirection < 0
 stBearish = stDirection > 0
 
@@ -108,8 +120,6 @@ mfVolume = mfMultiplier * volume
 cmf21 = ta.sma(mfVolume, 21) / math.max(ta.sma(volume, 21), 1)
 
 // --- ATR Volatility Regime ---
-atrVal = ta.atr(14)
-atrPct = atrVal / math.max(close, 0.0001) * 100
 atrPercentile = ta.percentrank(atrPct, 100)
 
 // Low volatility: below 30th percentile (squeeze territory, tighter thresholds)
@@ -271,22 +281,27 @@ isDistribute = compositeScore >= zoneDistribute and not isHold and not isAccumul
 isStrongSell = compositeScore < zoneDistribute
 
 // Signal generation with cooldown
-baseCooldown = 8
-cooldown = math.max(2, math.round(baseCooldown * sensCooldownMult))
+baseCooldown = 12  // Increased from 8 to reduce whipsaw
+cooldown = math.max(3, math.round(baseCooldown * sensCooldownMult))
 
 var int barsSinceSignal = 999
 var int lastSignalDir = 0
+var int barsInTrade = 0  // Track hold duration for min hold enforcement
 barsSinceSignal := barsSinceSignal + 1
+if lastSignalDir == 1
+    barsInTrade := barsInTrade + 1
 cooldownMet = barsSinceSignal >= cooldown
 
 // Buy signals: Strong Buy or Accumulate zone
-// Sell signals: Distribute or Strong Sell zone
-// Volume gate: suppress signals in extremely low volume
 buySignal  = (isStrongBuy or isAccumulate) and cooldownMet and lastSignalDir != 1 and volumeAdequate
-sellSignal = (isDistribute or isStrongSell) and cooldownMet and lastSignalDir != -1
 
-// Supertrend trailing stop exit: if bullish Supertrend flips bearish while in position
-stExitSignal = stBearish and lastSignalDir == 1
+// Sell signals: require BOTH score drop AND trend gate failure
+// Prevents premature exits when score dips briefly but trend is intact
+sellSignal = isStrongSell and not trendGatePass and lastSignalDir != -1
+
+// Supertrend trailing stop exit: only after minimum hold period
+// Short trades (<5 bars) have negative expectancy — min hold prevents this
+stExitSignal = stBearish and lastSignalDir == 1 and barsInTrade >= minHoldBars
 
 // Prevent simultaneous buy+sell
 buySignal  := buySignal and not sellSignal
@@ -315,10 +330,12 @@ if volRegimeHigh and buySignal and not isStrongBuy
 if buySignal
     lastSignalDir   := 1
     barsSinceSignal := 0
+    barsInTrade     := 0
 
 if sellSignal
     lastSignalDir   := -1
     barsSinceSignal := 0
+    barsInTrade     := 0
 
 // ═══════════════════════════════════════════
 // § 8 — STRATEGY EXECUTION
