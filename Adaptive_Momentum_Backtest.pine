@@ -138,7 +138,7 @@ rsiVal = ta.rsi(close, rsiLen)
 // --- Fisher Transform on RSI ---
 rsiNorm   = math.max(-0.999, math.min(0.999, (rsiVal - 50) / 50))
 fisherRSI = 0.5 * math.log((1 + rsiNorm) / math.max(1 - rsiNorm, 0.001))
-fisherPrev = 0.5 * math.log((1 + math.max(-0.999, math.min(0.999, (nz(rsiVal[1]) - 50) / 50))) / math.max(1 - math.max(-0.999, math.min(0.999, (nz(rsiVal[1]) - 50) / 50)), 0.001))
+fisherPrev = nz(fisherRSI[1])
 fisherCrossUp   = ta.crossover(fisherRSI, fisherPrev)
 fisherCrossDown = ta.crossunder(fisherRSI, fisherPrev)
 fisherExtremeLow  = fisherRSI < -1.5
@@ -173,6 +173,8 @@ kcUpper = kcBasis + kcRange * kcMult
 kcLower = kcBasis - kcRange * kcMult
 
 // --- TTM Squeeze ---
+// sqzCount via barssince(not sqzOn) gives consecutive bars IN squeeze;
+// sqzDuration[1] on the release bar = how long the squeeze lasted
 sqzOn  = bbLower > kcLower and bbUpper < kcUpper
 sqzOff = bbLower < kcLower and bbUpper > kcUpper
 sqzCount = ta.barssince(not sqzOn)
@@ -249,8 +251,8 @@ slopeMA    = ta.sma(priceSlope, 10)
 slopeStd   = ta.stdev(priceSlope, regimeLookback)
 slopeStdSafe = math.max(nz(slopeStd, 1.0), 0.001)
 
-regimeBull     = useRegime ? (nz(slopeMA) > slopeStdSafe * 0.5) : true
-regimeBear     = useRegime ? (nz(slopeMA) < -slopeStdSafe * 0.5) : true
+regimeBull     = useRegime ? (nz(slopeMA) > slopeStdSafe * 0.5) : false
+regimeBear     = useRegime ? (nz(slopeMA) < -slopeStdSafe * 0.5) : false
 regimeSideways = useRegime ? (math.abs(nz(slopeMA)) <= slopeStdSafe * 0.5) : false
 
 // ---- 5b: Volatility Clustering (GARCH-like) ----
@@ -303,15 +305,16 @@ if bar_index >= hurstLookback and useHurst
 hurstTrending      = useHurst ? (hurstExponent > 0.55) : true
 hurstMeanReverting = useHurst ? (hurstExponent < 0.45) : false
 
-// ---- 5d: Drawdown Control ----
-var float peakPrice = close
-var float currentDD = 0.0
+// ---- 5d: Drawdown Control (equity-based) ----
+var float peakEquity = strategy.initial_capital
+var float currentDD  = 0.0
 
-if close > peakPrice
-    peakPrice  := close
+currentEquity = strategy.equity
+if currentEquity > peakEquity
+    peakEquity := currentEquity
     currentDD  := 0.0
 else
-    currentDD := (peakPrice - close) / peakPrice * 100
+    currentDD := (peakEquity - currentEquity) / peakEquity * 100
 
 drawdownOK = useDrawdownCtrl ? currentDD < maxDrawdownPct : true
 
@@ -426,7 +429,7 @@ if (priceReclaimFast and goldenCross) or (priceReclaimFast and emaFastVal > emaS
     f4_trend := 2.0
 else if priceAboveFast and close > emaSlowVal and bothEmaRising
     f4_trend := 1.0
-else if (close > emaSlowVal and close < emaFastVal) or (close < emaFastVal and close > emaSlowVal)
+else if close > emaSlowVal and close < emaFastVal
     f4_trend := 0.0
 else if priceBelowFast and close < emaSlowVal and bothEmaFalling
     f4_trend := -1.0
@@ -456,7 +459,7 @@ else if close < bbBasis and close > bbLower and close > close[1]
     f6_bb := 1.0
 else if close > bbBasis and close < bbUpper and close < close[1]
     f6_bb := -1.0
-else if closedInsideFromUpper or (high[1] >= bbUpper[1] and close < bbUpper)
+else if closedInsideFromUpper
     f6_bb := -2.0
 
 // ---- Factor 7: Stochastic RSI Confirmation ----
@@ -663,8 +666,8 @@ eliteBuy  = compositeScore >= dynEliteBuy and cooldownMet and canBuy and not low
 eliteSell = compositeScore <= dynEliteSell and cooldownMet and canSell and not lowLiquidityFlag and not suppressSell and eliteGateSell
 
 // Combined signal flags (for strategy execution)
-anyBuy  = eliteBuy or buySignal
-anySell = eliteSell or sellSignal
+anyBuy  = (eliteBuy or buySignal) and not (eliteSell or sellSignal)
+anySell = (eliteSell or sellSignal) and not (eliteBuy or buySignal)
 
 // Update state
 if anyBuy
@@ -754,95 +757,82 @@ if anySell
     array.push(sellBarArr, bar_index)
     array.push(sellPriceArr, close)
 
-// Process BUY forward returns — check on every bar if any past buy is now N bars old
-// We scan through the arrays and compute returns at exactly 4, 8, 13, 26 bars after signal
-// To avoid reprocessing, we use a var tracking the last processed index
-var int buyProcessedUpTo4  = -1
-var int buyProcessedUpTo8  = -1
-var int buyProcessedUpTo13 = -1
-var int buyProcessedUpTo26 = -1
-var int buyProcessedUpToN  = -1
+// Process BUY forward returns — only scan from the oldest unprocessed signal onward
+// maxLookback is the furthest forward period we track (26, or forwardBars if larger)
+var int buyScanStart = 0
 
+maxFwdPeriod = math.max(26, forwardBars)
 if array.size(buyBarArr) > 0
-    for i = 0 to array.size(buyBarArr) - 1
-        sigBar   = array.get(buyBarArr, i)
-        sigPrice = array.get(buyPriceArr, i)
-        barsElapsed = bar_index - sigBar
+    // Advance scan start past signals that are fully processed (older than maxFwdPeriod bars)
+    for i = buyScanStart to array.size(buyBarArr) - 1
+        if bar_index - array.get(buyBarArr, i) > maxFwdPeriod
+            buyScanStart := i + 1
+        else
+            break
 
-        // 4-bar forward return
-        if barsElapsed == 4 and sigBar > buyProcessedUpTo4
-            buyFwd4Sum   := buyFwd4Sum + (close - sigPrice) / sigPrice * 100
-            buyFwd4Count := buyFwd4Count + 1
-            buyProcessedUpTo4 := sigBar
+    if buyScanStart < array.size(buyBarArr)
+        for i = buyScanStart to array.size(buyBarArr) - 1
+            sigBar   = array.get(buyBarArr, i)
+            sigPrice = array.get(buyPriceArr, i)
+            barsElapsed = bar_index - sigBar
 
-        // 8-bar forward return
-        if barsElapsed == 8 and sigBar > buyProcessedUpTo8
-            buyFwd8Sum   := buyFwd8Sum + (close - sigPrice) / sigPrice * 100
-            buyFwd8Count := buyFwd8Count + 1
-            buyProcessedUpTo8 := sigBar
+            if barsElapsed == 4
+                buyFwd4Sum   := buyFwd4Sum + (close - sigPrice) / sigPrice * 100
+                buyFwd4Count := buyFwd4Count + 1
 
-        // 13-bar forward return
-        if barsElapsed == 13 and sigBar > buyProcessedUpTo13
-            buyFwd13Sum   := buyFwd13Sum + (close - sigPrice) / sigPrice * 100
-            buyFwd13Count := buyFwd13Count + 1
-            buyProcessedUpTo13 := sigBar
+            if barsElapsed == 8
+                buyFwd8Sum   := buyFwd8Sum + (close - sigPrice) / sigPrice * 100
+                buyFwd8Count := buyFwd8Count + 1
 
-        // 26-bar forward return
-        if barsElapsed == 26 and sigBar > buyProcessedUpTo26
-            buyFwd26Sum   := buyFwd26Sum + (close - sigPrice) / sigPrice * 100
-            buyFwd26Count := buyFwd26Count + 1
-            buyProcessedUpTo26 := sigBar
+            if barsElapsed == 13
+                buyFwd13Sum   := buyFwd13Sum + (close - sigPrice) / sigPrice * 100
+                buyFwd13Count := buyFwd13Count + 1
 
-        // N-bar hit rate (configurable)
-        if barsElapsed == forwardBars and sigBar > buyProcessedUpToN
-            buyTotalN := buyTotalN + 1
-            if close > sigPrice
-                buyCorrectN := buyCorrectN + 1
-            buyProcessedUpToN := sigBar
+            if barsElapsed == 26
+                buyFwd26Sum   := buyFwd26Sum + (close - sigPrice) / sigPrice * 100
+                buyFwd26Count := buyFwd26Count + 1
 
-// Process SELL forward returns
-var int sellProcessedUpTo4  = -1
-var int sellProcessedUpTo8  = -1
-var int sellProcessedUpTo13 = -1
-var int sellProcessedUpTo26 = -1
-var int sellProcessedUpToN  = -1
+            if barsElapsed == forwardBars
+                buyTotalN := buyTotalN + 1
+                if close > sigPrice
+                    buyCorrectN := buyCorrectN + 1
+
+// Process SELL forward returns — only scan from the oldest unprocessed signal onward
+var int sellScanStart = 0
 
 if array.size(sellBarArr) > 0
-    for i = 0 to array.size(sellBarArr) - 1
-        sigBar   = array.get(sellBarArr, i)
-        sigPrice = array.get(sellPriceArr, i)
-        barsElapsed = bar_index - sigBar
+    for i = sellScanStart to array.size(sellBarArr) - 1
+        if bar_index - array.get(sellBarArr, i) > maxFwdPeriod
+            sellScanStart := i + 1
+        else
+            break
 
-        // 4-bar forward return
-        if barsElapsed == 4 and sigBar > sellProcessedUpTo4
-            sellFwd4Sum   := sellFwd4Sum + (close - sigPrice) / sigPrice * 100
-            sellFwd4Count := sellFwd4Count + 1
-            sellProcessedUpTo4 := sigBar
+    if sellScanStart < array.size(sellBarArr)
+        for i = sellScanStart to array.size(sellBarArr) - 1
+            sigBar   = array.get(sellBarArr, i)
+            sigPrice = array.get(sellPriceArr, i)
+            barsElapsed = bar_index - sigBar
 
-        // 8-bar forward return
-        if barsElapsed == 8 and sigBar > sellProcessedUpTo8
-            sellFwd8Sum   := sellFwd8Sum + (close - sigPrice) / sigPrice * 100
-            sellFwd8Count := sellFwd8Count + 1
-            sellProcessedUpTo8 := sigBar
+            if barsElapsed == 4
+                sellFwd4Sum   := sellFwd4Sum + (close - sigPrice) / sigPrice * 100
+                sellFwd4Count := sellFwd4Count + 1
 
-        // 13-bar forward return
-        if barsElapsed == 13 and sigBar > sellProcessedUpTo13
-            sellFwd13Sum   := sellFwd13Sum + (close - sigPrice) / sigPrice * 100
-            sellFwd13Count := sellFwd13Count + 1
-            sellProcessedUpTo13 := sigBar
+            if barsElapsed == 8
+                sellFwd8Sum   := sellFwd8Sum + (close - sigPrice) / sigPrice * 100
+                sellFwd8Count := sellFwd8Count + 1
 
-        // 26-bar forward return
-        if barsElapsed == 26 and sigBar > sellProcessedUpTo26
-            sellFwd26Sum   := sellFwd26Sum + (close - sigPrice) / sigPrice * 100
-            sellFwd26Count := sellFwd26Count + 1
-            sellProcessedUpTo26 := sigBar
+            if barsElapsed == 13
+                sellFwd13Sum   := sellFwd13Sum + (close - sigPrice) / sigPrice * 100
+                sellFwd13Count := sellFwd13Count + 1
 
-        // N-bar hit rate (configurable)
-        if barsElapsed == forwardBars and sigBar > sellProcessedUpToN
-            sellTotalN := sellTotalN + 1
-            if close < sigPrice
-                sellCorrectN := sellCorrectN + 1
-            sellProcessedUpToN := sigBar
+            if barsElapsed == 26
+                sellFwd26Sum   := sellFwd26Sum + (close - sigPrice) / sigPrice * 100
+                sellFwd26Count := sellFwd26Count + 1
+
+            if barsElapsed == forwardBars
+                sellTotalN := sellTotalN + 1
+                if close < sigPrice
+                    sellCorrectN := sellCorrectN + 1
 
 // ═══════════════════════════════════════════
 // § 11 — BACKTEST STATS TABLE
@@ -873,7 +863,7 @@ if barstate.islast
                     losses := losses + 1
                     lossPctSum := lossPctSum + tradePct
 
-    winRate    = totalTrades > 0 ? wins / totalTrades * 100 : 0.0
+    winRate    = totalTrades > 0 ? wins * 100.0 / totalTrades : 0.0
     avgWinPct  = wins > 0 ? winPctSum / wins : 0.0
     avgLossPct = losses > 0 ? lossPctSum / losses : 0.0
 
@@ -891,8 +881,8 @@ if barstate.islast
     sellAvg13 = sellFwd13Count > 0 ? sellFwd13Sum / sellFwd13Count : na
     sellAvg26 = sellFwd26Count > 0 ? sellFwd26Sum / sellFwd26Count : na
 
-    buyHitRate  = buyTotalN > 0 ? buyCorrectN / buyTotalN * 100 : na
-    sellHitRate = sellTotalN > 0 ? sellCorrectN / sellTotalN * 100 : na
+    buyHitRate  = buyTotalN > 0 ? buyCorrectN * 100.0 / buyTotalN : na
+    sellHitRate = sellTotalN > 0 ? sellCorrectN * 100.0 / sellTotalN : na
 
     // ---- Build table ----
     var table stats = table.new(position.bottom_right, 3, 24,
