@@ -439,11 +439,12 @@ var int sellScanStart = 0
 maxFwdPeriod = math.max(26, forwardBars)
 
 if array.size(buyBarArr) > 0
-    for i = buyScanStart to array.size(buyBarArr) - 1
-        if bar_index - array.get(buyBarArr, i) > maxFwdPeriod
-            buyScanStart := i + 1
-        else
-            break
+    if buyScanStart < array.size(buyBarArr)
+        for i = buyScanStart to array.size(buyBarArr) - 1
+            if bar_index - array.get(buyBarArr, i) > maxFwdPeriod
+                buyScanStart := i + 1
+            else
+                break
     if buyScanStart < array.size(buyBarArr)
         for i = buyScanStart to array.size(buyBarArr) - 1
             sigBar = array.get(buyBarArr, i)
@@ -467,11 +468,12 @@ if array.size(buyBarArr) > 0
                     buyCorrectN := buyCorrectN + 1
 
 if array.size(sellBarArr) > 0
-    for i = sellScanStart to array.size(sellBarArr) - 1
-        if bar_index - array.get(sellBarArr, i) > maxFwdPeriod
-            sellScanStart := i + 1
-        else
-            break
+    if sellScanStart < array.size(sellBarArr)
+        for i = sellScanStart to array.size(sellBarArr) - 1
+            if bar_index - array.get(sellBarArr, i) > maxFwdPeriod
+                sellScanStart := i + 1
+            else
+                break
     if sellScanStart < array.size(sellBarArr)
         for i = sellScanStart to array.size(sellBarArr) - 1
             sigBar = array.get(sellBarArr, i)
