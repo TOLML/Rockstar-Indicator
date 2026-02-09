@@ -105,7 +105,7 @@ def calc_supertrend(high, low, close, period=14, multiplier=3.0):
 
 def calc_percentrank(series, period=100):
     return series.rolling(window=period, min_periods=period).apply(
-        lambda x: pd.Series(x).rank(pct=True).iloc[-1], raw=False
+        lambda x: np.sum(x <= x[-1]) / len(x), raw=True
     )
 
 
@@ -236,9 +236,6 @@ class HierarchicalMomentumStrategy:
         bb_std = close.rolling(20).std()
         bb_upper = bb_basis + 2.0 * bb_std
         bb_lower = bb_basis - 2.0 * bb_std
-        bb_width = bb_upper - bb_lower
-        bb_width_pctile = calc_percentrank(bb_width, 100)
-
         kc_range = calc_atr(high, low, close, 20)
         kc_upper = bb_basis + kc_range * 1.5
         kc_lower = bb_basis - kc_range * 1.5
@@ -262,18 +259,15 @@ class HierarchicalMomentumStrategy:
         median_atr_pct = atr_pct.rolling(252, min_periods=50).median()
         # Scale: if median ATR% < 1.0 (low vol like SPY), widen to 4-5x
         # If median ATR% > 3.0 (high vol like BTC), keep at base 3x
-        st_mult_auto = pd.Series(self.st_mult, index=df.index)
-        for i in range(n):
-            m = median_atr_pct.iloc[i] if not pd.isna(median_atr_pct.iloc[i]) else 2.0
-            if m < 0.8:
-                st_mult_auto.iloc[i] = self.st_mult + 2.0  # Very low vol: +2
-            elif m < 1.5:
-                st_mult_auto.iloc[i] = self.st_mult + 1.0  # Low vol: +1
-            elif m > 4.0:
-                st_mult_auto.iloc[i] = max(2.0, self.st_mult - 0.5)  # Very high vol: tighter
+        m = median_atr_pct.fillna(2.0).values
+        st_mult_auto = np.select(
+            [m < 0.8, m < 1.5, m > 4.0],
+            [self.st_mult + 2.0, self.st_mult + 1.0, max(2.0, self.st_mult - 0.5)],
+            default=self.st_mult
+        )
 
         # Use the median auto-scaled multiplier for Supertrend
-        effective_st_mult = st_mult_auto.median()
+        effective_st_mult = float(np.median(st_mult_auto))
         st_value, st_direction = calc_supertrend(high, low, close, self.st_period, effective_st_mult)
         st_bullish = st_direction > 0
         st_score = pd.Series(np.where(st_bullish, 0.5, -0.5), index=df.index)
@@ -281,36 +275,30 @@ class HierarchicalMomentumStrategy:
         # ═══════════════════════════════════════
         # COMPOSITE SCORE (0–10)
         # ═══════════════════════════════════════
-        composite = pd.Series(0.0, index=df.index)
+        # Vectorized composite score computation
+        tg = trend_gate.values.astype(bool)
+        sma_nan = pd.isna(sma200).values
 
-        for i in range(n):
-            if pd.isna(sma200.iloc[i]):
-                composite.iloc[i] = 5.0
-                continue
+        # Uptrend score
+        up_raw = (5.0
+                  + momentum_score.values * 1.5
+                  + obv_score.values * 0.6
+                  + cmf_score.values * 0.4
+                  + vol_confirm.values * 0.3
+                  + atr_score.values * 0.3
+                  + squeeze_score.values * 0.5
+                  + st_score.values * 0.4)
+        # Contrarian RSI extreme floor
+        up_raw = np.where(rsi_extreme_low.values, np.maximum(up_raw, 7.0), up_raw)
 
-            if trend_gate.iloc[i]:
-                base = 5.0
-                mom = momentum_score.iloc[i] * 1.5
-                obv_c = obv_score.iloc[i] * 0.6
-                cmf_c = cmf_score.iloc[i] * 0.4
-                vol_c = vol_confirm.iloc[i] * 0.3
-                atr_c = atr_score.iloc[i] * 0.3
-                sqz_c = squeeze_score.iloc[i] * 0.5
-                st_c = st_score.iloc[i] * 0.4
-                raw = base + mom + obv_c + cmf_c + vol_c + atr_c + sqz_c + st_c
+        # Downtrend score
+        dn_raw = (2.0
+                  + momentum_score.values * 0.8
+                  + st_score.values * 0.4
+                  + squeeze_score.values * 0.3)
 
-                # Contrarian RSI extreme
-                if rsi_extreme_low.iloc[i]:
-                    raw = max(raw, 7.0)
-
-                composite.iloc[i] = max(0.0, min(10.0, raw))
-            else:
-                base = 2.0
-                mom = momentum_score.iloc[i] * 0.8
-                st_c = st_score.iloc[i] * 0.4
-                sqz_c = squeeze_score.iloc[i] * 0.3
-                raw = base + mom + st_c + sqz_c
-                composite.iloc[i] = max(0.0, min(10.0, raw))
+        raw_scores = np.where(sma_nan, 5.0, np.where(tg, up_raw, dn_raw))
+        composite = pd.Series(np.clip(raw_scores, 0.0, 10.0), index=df.index)
 
         # ═══════════════════════════════════════
         # COMPOSITE SCORE SMOOTHING
@@ -332,26 +320,30 @@ class HierarchicalMomentumStrategy:
         # ═══════════════════════════════════════
         # SIGNAL GENERATION
         # ═══════════════════════════════════════
-        signals = pd.Series(0, index=df.index)
+        sig_out = np.zeros(n, dtype=np.int8)
+        comp_arr = composite.values
+        tg_arr = trend_gate.values
+        st_dir_arr = st_direction.values
+        vol_adeq_arr = volume_adequate.values
+        vrh_arr = vol_regime_high.values
+        close_arr = close.values
+
         bars_since = 999
         last_dir = 0
-        bars_in_trade = 0  # Track how long we've been in current trade
+        bars_in_trade = 0
 
         peak_equity = 1.0
         equity = 1.0
         in_position = False
-        prev_zone = 'hold'  # Zone hysteresis state
+        prev_zone = 'hold'
 
         for i in range(1, n):
             bars_since += 1
             if in_position:
                 bars_in_trade += 1
             cooldown_met = bars_since >= self.cooldown
-            score = composite.iloc[i]
+            score = comp_arr[i]
 
-            # Zone classification with hysteresis
-            # When in bullish zone, use lower exit thresholds (sticky bullish)
-            # When in neutral/bearish zone, use standard entry thresholds
             if prev_zone in ('strong_buy', 'accumulate'):
                 is_strong_buy = score >= self.zone_strong_buy_exit
                 is_accumulate = score >= self.zone_accumulate_exit and not is_strong_buy
@@ -363,7 +355,6 @@ class HierarchicalMomentumStrategy:
                 is_distribute = score >= self.zone_distribute and score < self.zone_hold
                 is_strong_sell = score < self.zone_distribute
 
-            # Update zone state
             if is_strong_buy:
                 prev_zone = 'strong_buy'
             elif is_accumulate:
@@ -378,31 +369,25 @@ class HierarchicalMomentumStrategy:
             buy_sig = (is_strong_buy or is_accumulate) and cooldown_met and last_dir != 1
             sell_sig = False
 
-            # Score-based sell: only exit when BOTH score drops AND trend gate fails
-            # This prevents premature exits when score dips but trend is intact
-            trend_failed = not trend_gate.iloc[i] if not pd.isna(trend_gate.iloc[i]) else False
+            tg_val = tg_arr[i]
+            trend_failed = not tg_val if tg_val == tg_val else False  # NaN check
             if (is_strong_sell and trend_failed) and last_dir != -1:
                 sell_sig = True
 
-            # Supertrend trailing stop — only after minimum hold period
-            st_exit = (st_direction.iloc[i] < 0 and last_dir == 1 and
+            st_exit = (st_dir_arr[i] < 0 and last_dir == 1 and
                        bars_in_trade >= self.min_hold_bars)
 
-            # Volume gate
-            if not volume_adequate.iloc[i]:
+            if not vol_adeq_arr[i]:
                 buy_sig = False
 
-            # Prevent simultaneous
             buy_sig = buy_sig and not sell_sig
             sell_sig = (sell_sig or st_exit) and not buy_sig
 
-            # High vol regime gate
-            if vol_regime_high.iloc[i] and buy_sig and not is_strong_buy:
+            if vrh_arr[i] and buy_sig and not is_strong_buy:
                 buy_sig = False
 
-            # Drawdown control
             if in_position:
-                ret = close.iloc[i] / close.iloc[i-1] if close.iloc[i-1] > 0 else 1.0
+                ret = close_arr[i] / close_arr[i-1] if close_arr[i-1] > 0 else 1.0
                 equity *= ret
                 if equity > peak_equity:
                     peak_equity = equity
@@ -412,7 +397,7 @@ class HierarchicalMomentumStrategy:
                     buy_sig = False
 
             if buy_sig:
-                signals.iloc[i] = 1
+                sig_out[i] = 1
                 last_dir = 1
                 bars_since = 0
                 bars_in_trade = 0
@@ -421,12 +406,13 @@ class HierarchicalMomentumStrategy:
                     equity = 1.0
                     peak_equity = 1.0
             elif sell_sig:
-                signals.iloc[i] = -1
+                sig_out[i] = -1
                 last_dir = -1
                 bars_since = 0
                 bars_in_trade = 0
                 in_position = False
 
+        signals = pd.Series(sig_out, index=df.index)
         return signals, composite, {
             'trend_gate': trend_gate,
             'momentum_confirmed': momentum_confirmed,
@@ -442,8 +428,11 @@ class HierarchicalMomentumStrategy:
 # ═══════════════════════════════════════════
 
 def backtest(df, signals, commission_pct=0.1, slippage_pct=0.05):
-    close = df['Close'].copy()
+    c = df['Close'].values  # numpy array for fast indexing
+    close = df['Close']
     n = len(df)
+    sig_arr = signals.values
+    cost_pct = (commission_pct + slippage_pct) / 100
 
     equity = 100000.0
     peak_equity = equity
@@ -455,104 +444,101 @@ def backtest(df, signals, commission_pct=0.1, slippage_pct=0.05):
 
     for i in range(1, n):
         if position == 1:
-            daily_return = close.iloc[i] / close.iloc[i-1] if close.iloc[i-1] > 0 else 1.0
+            daily_return = c[i] / c[i-1] if c[i-1] > 0 else 1.0
             equity *= daily_return
 
         if equity > peak_equity:
             peak_equity = equity
         dd = (peak_equity - equity) / peak_equity * 100
-        max_dd = max(max_dd, dd)
+        if dd > max_dd:
+            max_dd = dd
 
-        sig = signals.iloc[i]
+        sig = sig_arr[i]
         if sig == 1 and position == 0:
-            cost = equity * (commission_pct + slippage_pct) / 100
-            equity -= cost
-            entry_price = close.iloc[i]
+            equity -= equity * cost_pct
+            entry_price = c[i]
             position = 1
         elif sig == -1 and position == 1:
-            cost = equity * (commission_pct + slippage_pct) / 100
-            equity -= cost
-            exit_price = close.iloc[i]
-            trade_pct = (exit_price - entry_price) / entry_price * 100
-            trades.append({'pct_return': trade_pct})
+            equity -= equity * cost_pct
+            trade_pct = (c[i] - entry_price) / entry_price * 100
+            trades.append(trade_pct)
             position = 0
 
         equity_curve.append(equity)
 
     # Also compute buy-and-hold with same costs
     bh_equity = 100000.0
-    bh_cost = bh_equity * (commission_pct + slippage_pct) / 100
-    bh_equity -= bh_cost
-    bh_equity *= (close.iloc[-1] / close.iloc[0])
-    bh_cost2 = bh_equity * (commission_pct + slippage_pct) / 100
-    bh_equity -= bh_cost2
+    bh_equity -= bh_equity * cost_pct
+    bh_equity *= (c[-1] / c[0])
+    bh_equity -= bh_equity * cost_pct
     bh_return = (bh_equity / 100000 - 1) * 100
 
     # Faber 10-month SMA benchmark
     sma200 = calc_sma(close, 200)
+    sma_arr = sma200.values
     faber_equity = 100000.0
     faber_position = 0
     faber_trades = 0
     for i in range(1, n):
         if faber_position == 1:
-            faber_equity *= close.iloc[i] / close.iloc[i-1] if close.iloc[i-1] > 0 else 1.0
-        if not pd.isna(sma200.iloc[i]):
-            if close.iloc[i] > sma200.iloc[i] and faber_position == 0:
-                faber_cost = faber_equity * (commission_pct + slippage_pct) / 100
-                faber_equity -= faber_cost
+            faber_equity *= c[i] / c[i-1] if c[i-1] > 0 else 1.0
+        s = sma_arr[i]
+        if s == s:  # fast NaN check (NaN != NaN)
+            if c[i] > s and faber_position == 0:
+                faber_equity -= faber_equity * cost_pct
                 faber_position = 1
                 faber_trades += 1
-            elif close.iloc[i] < sma200.iloc[i] and faber_position == 1:
-                faber_cost = faber_equity * (commission_pct + slippage_pct) / 100
-                faber_equity -= faber_cost
+            elif c[i] < s and faber_position == 1:
+                faber_equity -= faber_equity * cost_pct
                 faber_position = 0
                 faber_trades += 1
     faber_return = (faber_equity / 100000 - 1) * 100
 
     # Compute metrics
-    total_trades = len(trades)
-    wins = [t for t in trades if t['pct_return'] >= 0]
-    losses_list = [t for t in trades if t['pct_return'] < 0]
-    win_rate = len(wins) / total_trades * 100 if total_trades > 0 else 0
-    avg_win = np.mean([t['pct_return'] for t in wins]) if wins else 0
-    avg_loss = np.mean([t['pct_return'] for t in losses_list]) if losses_list else 0
-    gross_profit = sum(t['pct_return'] for t in wins)
-    gross_loss = abs(sum(t['pct_return'] for t in losses_list))
-    profit_factor = gross_profit / gross_loss if gross_loss > 0 else 999
+    trade_arr = np.array(trades) if trades else np.array([])
+    total_trades = len(trade_arr)
+    if total_trades > 0:
+        win_mask = trade_arr >= 0
+        loss_mask = ~win_mask
+        n_wins = int(win_mask.sum())
+        n_losses = int(loss_mask.sum())
+        win_rate = n_wins / total_trades * 100
+        avg_win = float(trade_arr[win_mask].mean()) if n_wins > 0 else 0
+        avg_loss = float(trade_arr[loss_mask].mean()) if n_losses > 0 else 0
+        gross_profit = float(trade_arr[win_mask].sum()) if n_wins > 0 else 0
+        gross_loss = abs(float(trade_arr[loss_mask].sum())) if n_losses > 0 else 0
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else 999
+    else:
+        n_wins = n_losses = 0
+        win_rate = avg_win = avg_loss = gross_profit = gross_loss = 0
+        profit_factor = 999
     strat_return = (equity / 100000 - 1) * 100
 
-    # Forward returns
-    fwd_returns = {}
-    buy_indices = signals[signals == 1].index
-    sell_indices = signals[signals == -1].index
+    # Forward returns — pre-compute integer locations once
+    buy_locs = np.where(sig_arr == 1)[0]
+    sell_locs = np.where(sig_arr == -1)[0]
 
+    fwd_returns = {}
     for period in [4, 8, 13, 26]:
-        buy_fwds, sell_fwds = [], []
-        for idx in buy_indices:
-            loc = df.index.get_loc(idx)
-            if loc + period < n:
-                buy_fwds.append((close.iloc[loc + period] - close.iloc[loc]) / close.iloc[loc] * 100)
-        for idx in sell_indices:
-            loc = df.index.get_loc(idx)
-            if loc + period < n:
-                sell_fwds.append((close.iloc[loc + period] - close.iloc[loc]) / close.iloc[loc] * 100)
+        valid_buy = buy_locs[buy_locs + period < n]
+        valid_sell = sell_locs[sell_locs + period < n]
+        buy_fwds = (c[valid_buy + period] - c[valid_buy]) / c[valid_buy] * 100 if len(valid_buy) > 0 else np.array([])
+        sell_fwds = (c[valid_sell + period] - c[valid_sell]) / c[valid_sell] * 100 if len(valid_sell) > 0 else np.array([])
         fwd_returns[period] = {
-            'buy_avg': np.mean(buy_fwds) if buy_fwds else None, 'buy_n': len(buy_fwds),
-            'sell_avg': np.mean(sell_fwds) if sell_fwds else None, 'sell_n': len(sell_fwds),
+            'buy_avg': float(buy_fwds.mean()) if len(buy_fwds) > 0 else None, 'buy_n': len(buy_fwds),
+            'sell_avg': float(sell_fwds.mean()) if len(sell_fwds) > 0 else None, 'sell_n': len(sell_fwds),
         }
 
-    # Hit rates
-    buy_correct_13 = sum(1 for idx in buy_indices
-                         if df.index.get_loc(idx) + 13 < n and
-                         close.iloc[df.index.get_loc(idx) + 13] > close.iloc[df.index.get_loc(idx)])
-    buy_total_13 = sum(1 for idx in buy_indices if df.index.get_loc(idx) + 13 < n)
-    sell_correct_13 = sum(1 for idx in sell_indices
-                          if df.index.get_loc(idx) + 13 < n and
-                          close.iloc[df.index.get_loc(idx) + 13] < close.iloc[df.index.get_loc(idx)])
-    sell_total_13 = sum(1 for idx in sell_indices if df.index.get_loc(idx) + 13 < n)
+    # Hit rates (13-bar forward)
+    valid_buy_13 = buy_locs[buy_locs + 13 < n]
+    valid_sell_13 = sell_locs[sell_locs + 13 < n]
+    buy_total_13 = len(valid_buy_13)
+    sell_total_13 = len(valid_sell_13)
+    buy_correct_13 = int((c[valid_buy_13 + 13] > c[valid_buy_13]).sum()) if buy_total_13 > 0 else 0
+    sell_correct_13 = int((c[valid_sell_13 + 13] < c[valid_sell_13]).sum()) if sell_total_13 > 0 else 0
 
     return {
-        'total_trades': total_trades, 'wins': len(wins), 'losses': len(losses_list),
+        'total_trades': total_trades, 'wins': n_wins, 'losses': n_losses,
         'win_rate': win_rate, 'avg_win_pct': avg_win, 'avg_loss_pct': avg_loss,
         'profit_factor': profit_factor, 'max_drawdown': max_dd,
         'net_return_pct': strat_return, 'buy_hold_return_pct': bh_return,
@@ -561,7 +547,7 @@ def backtest(df, signals, commission_pct=0.1, slippage_pct=0.05):
         'forward_returns': fwd_returns,
         'buy_hit_rate_13': buy_correct_13 / buy_total_13 * 100 if buy_total_13 > 0 else None,
         'sell_hit_rate_13': sell_correct_13 / sell_total_13 * 100 if sell_total_13 > 0 else None,
-        'buy_signals': len(buy_indices), 'sell_signals': len(sell_indices),
+        'buy_signals': len(buy_locs), 'sell_signals': len(sell_locs),
         'final_equity': equity,
     }
 

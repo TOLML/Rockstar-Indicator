@@ -108,7 +108,6 @@ avgRoc = nz(roc21) * 0.1 + nz(roc63) * 0.2 + nz(roc126) * 0.3 + nz(roc252) * 0.4
 // --- RSI(14) as trend filter, NOT overbought/oversold oscillator ---
 rsiVal = ta.rsi(close, 14)
 rsiAbove50 = rsiVal > 50
-rsiBelow50 = rsiVal < 50
 
 // Rare contrarian flag: monthly RSI < 30 (mean-reversion buy opportunity)
 rsiExtremeLow = rsiVal < 30
@@ -131,7 +130,6 @@ atrPercentile = ta.percentrank(atrPct, 100)
 // High volatility: above 70th percentile (widen stops, require stronger confirmation)
 volRegimeLow  = atrPercentile < 30
 volRegimeHigh = atrPercentile > 70
-volRegimeNorm = not volRegimeLow and not volRegimeHigh
 
 // --- Bollinger Band Squeeze Detection ---
 bbLen = 20
@@ -139,15 +137,10 @@ bbBasis = ta.sma(close, bbLen)
 bbDev = 2.0 * ta.stdev(close, bbLen)
 bbUpper = bbBasis + bbDev
 bbLower = bbBasis - bbDev
-bbWidth = bbUpper - bbLower
-bbWidthPctile = ta.percentrank(bbWidth, 100)
-squeeze = bbWidthPctile < 20  // BB width in bottom 20th percentile
-
 // Keltner for squeeze confirmation
-kcBasis = ta.sma(close, bbLen)
 kcRange = ta.atr(bbLen)
-kcUpper = kcBasis + kcRange * 1.5
-kcLower = kcBasis - kcRange * 1.5
+kcUpper = bbBasis + kcRange * 1.5
+kcLower = bbBasis - kcRange * 1.5
 squeezeConfirmed = bbLower > kcLower and bbUpper < kcUpper
 
 // Squeeze release detection
@@ -171,16 +164,7 @@ volRatio = volume / math.max(nz(volSma50, 1), 1)
 volSpike = volRatio >= 2.0
 
 // ═══════════════════════════════════════════
-// § 3 — LAYER 1: TREND GATE
-// ═══════════════════════════════════════════
-// Faber (2007): Price above long-term SMA = uptrend.
-// This single rule is responsible for majority of drawdown reduction.
-// If trend gate fails, system outputs Distribute/Strong Sell.
-
-trendScore = trendGatePass ? 1.0 : -1.0
-
-// ═══════════════════════════════════════════
-// § 4 — LAYER 2: MOMENTUM CONFIRMATION
+// § 3-4 — MOMENTUM CONFIRMATION
 // ═══════════════════════════════════════════
 // Jegadeesh-Titman: 12-month ROC positive AND RSI(14) > 50.
 // Both must confirm to distinguish genuine momentum from sideways drift.
@@ -270,10 +254,29 @@ rawScoreClamped = math.max(0.0, math.min(10.0, rawScore))
 // Base smoothing period scales with sensitivity
 // Then auto-adjusts based on asset volatility: low-vol assets (equities)
 // need more smoothing (noisier scores), high-vol assets (crypto) need less
+//
+// NOTE: ta.ema() requires simple int length. Since smoothAdjust depends on
+// medianAtrPct (series float), we pre-compute all possible EMA periods (2-7)
+// and select at runtime via ternary. All EMAs are O(1) per bar.
 baseSmoothPeriod = sensLevel == 2 ? 2 : sensLevel <= 3 ? 1 : sensLevel == 4 ? 2 : sensLevel <= 6 ? 3 : 4
 smoothAdjust = medianAtrPct < 1.5 ? 3 : medianAtrPct < 2.5 ? 1 : 0
 scoreSmoothPeriod = baseSmoothPeriod + smoothAdjust
-compositeScore = scoreSmoothPeriod > 1 ? ta.ema(rawScoreClamped, scoreSmoothPeriod) : rawScoreClamped
+
+// Pre-compute all possible EMA periods (simple int lengths)
+scoreEma2 = ta.ema(rawScoreClamped, 2)
+scoreEma3 = ta.ema(rawScoreClamped, 3)
+scoreEma4 = ta.ema(rawScoreClamped, 4)
+scoreEma5 = ta.ema(rawScoreClamped, 5)
+scoreEma6 = ta.ema(rawScoreClamped, 6)
+scoreEma7 = ta.ema(rawScoreClamped, 7)
+
+// Select the correct pre-computed EMA based on runtime period
+compositeScore = scoreSmoothPeriod <= 1 ? rawScoreClamped :
+                 scoreSmoothPeriod == 2 ? scoreEma2 :
+                 scoreSmoothPeriod == 3 ? scoreEma3 :
+                 scoreSmoothPeriod == 4 ? scoreEma4 :
+                 scoreSmoothPeriod == 5 ? scoreEma5 :
+                 scoreSmoothPeriod == 6 ? scoreEma6 : scoreEma7
 compositeScore := math.max(0.0, math.min(10.0, compositeScore))
 
 // ═══════════════════════════════════════════
