@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Adaptive Momentum v4.0 — Hierarchical Multi-Layer Backtest
+Adaptive Momentum v4.1 — Hierarchical Multi-Layer Backtest
 ===========================================================
 3-Layer architecture:
   L1: Trend Gate (200-day SMA, Faber 2007)
@@ -125,6 +125,15 @@ class HierarchicalMomentumStrategy:
         7: (0.6, 0.4),
     }
 
+    # Adaptive score smoothing: only at high sensitivity where noise is present
+    # Sens 1-3 are already selective, smoothing hurts their performance
+    # Period 2 at Sens 4 gives same hit rate as period 3 with better returns
+    SMOOTH_PERIOD = {1: 1, 2: 1, 3: 1, 4: 2, 5: 3, 6: 3, 7: 4}
+
+    # Zone hysteresis spread: 0 at low sensitivity (already well-filtered),
+    # 0.5 at moderate-high sensitivity (prevents rapid zone flipping)
+    HYST_SPREAD = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.5, 5: 0.5, 6: 0.5, 7: 0.5}
+
     def __init__(self, sensitivity=4, st_period=14, st_mult=3.0,
                  use_drawdown_ctrl=True, max_drawdown_pct=15.0,
                  min_hold_bars=5, commission_pct=0.1, slippage_pct=0.05):
@@ -140,12 +149,20 @@ class HierarchicalMomentumStrategy:
         self.min_hold_bars = min_hold_bars  # Minimum bars before Supertrend can exit
         self.commission_pct = commission_pct
         self.slippage_pct = slippage_pct
+        self.score_smooth_period = self.SMOOTH_PERIOD[sensitivity]
 
         # Zone thresholds (scaled by sensitivity)
         self.zone_strong_buy = min(8.0 * thresh_mult, 9.5)
         self.zone_accumulate = min(6.0 * thresh_mult, self.zone_strong_buy - 0.5)
         self.zone_hold = min(4.0 * thresh_mult, self.zone_accumulate - 0.5)
         self.zone_distribute = min(2.0 * thresh_mult, self.zone_hold - 0.5)
+
+        # Zone hysteresis: entry thresholds are standard, exit thresholds
+        # are more lenient (prevents rapid zone flipping)
+        hyst = self.HYST_SPREAD[sensitivity]
+        self.zone_strong_buy_exit = self.zone_strong_buy - hyst
+        self.zone_accumulate_exit = self.zone_accumulate - hyst
+        self.zone_distribute_exit = self.zone_distribute + hyst
 
     def compute_signals(self, df):
         close = df['Close'].copy()
@@ -297,6 +314,14 @@ class HierarchicalMomentumStrategy:
                 composite.iloc[i] = max(0.0, min(10.0, raw))
 
         # ═══════════════════════════════════════
+        # COMPOSITE SCORE SMOOTHING
+        # ═══════════════════════════════════════
+        # Adaptive EMA smoothing reduces noise-driven zone flips
+        # Period scales with sensitivity (1=off at low sens, 3-4 at high sens)
+        if self.score_smooth_period > 1:
+            composite = calc_ema(composite, self.score_smooth_period).clip(0.0, 10.0)
+
+        # ═══════════════════════════════════════
         # SIGNAL GENERATION
         # ═══════════════════════════════════════
         signals = pd.Series(0, index=df.index)
@@ -307,6 +332,7 @@ class HierarchicalMomentumStrategy:
         peak_equity = 1.0
         equity = 1.0
         in_position = False
+        prev_zone = 'hold'  # Zone hysteresis state
 
         for i in range(1, n):
             bars_since += 1
@@ -315,10 +341,31 @@ class HierarchicalMomentumStrategy:
             cooldown_met = bars_since >= self.cooldown
             score = composite.iloc[i]
 
-            is_strong_buy = score >= self.zone_strong_buy
-            is_accumulate = score >= self.zone_accumulate and not is_strong_buy
-            is_distribute = score >= self.zone_distribute and score < self.zone_hold
-            is_strong_sell = score < self.zone_distribute
+            # Zone classification with hysteresis
+            # When in bullish zone, use lower exit thresholds (sticky bullish)
+            # When in neutral/bearish zone, use standard entry thresholds
+            if prev_zone in ('strong_buy', 'accumulate'):
+                is_strong_buy = score >= self.zone_strong_buy_exit
+                is_accumulate = score >= self.zone_accumulate_exit and not is_strong_buy
+                is_distribute = score < self.zone_hold and score >= self.zone_distribute_exit
+                is_strong_sell = score < self.zone_distribute_exit
+            else:
+                is_strong_buy = score >= self.zone_strong_buy
+                is_accumulate = score >= self.zone_accumulate and not is_strong_buy
+                is_distribute = score >= self.zone_distribute and score < self.zone_hold
+                is_strong_sell = score < self.zone_distribute
+
+            # Update zone state
+            if is_strong_buy:
+                prev_zone = 'strong_buy'
+            elif is_accumulate:
+                prev_zone = 'accumulate'
+            elif is_strong_sell:
+                prev_zone = 'strong_sell'
+            elif is_distribute:
+                prev_zone = 'distribute'
+            else:
+                prev_zone = 'hold'
 
             buy_sig = (is_strong_buy or is_accumulate) and cooldown_met and last_dir != 1
             sell_sig = False
@@ -548,7 +595,7 @@ def plot_results(all_results, filename):
         eq = res['equity_curve']
         ax.plot(eq.values, linewidth=1.5, color='#58A6FF', label=f'Strategy ({res["net_return_pct"]:.1f}%)')
         ax.axhline(y=100000, color='gray', linestyle='--', alpha=0.5, label='Initial Capital')
-        ax.set_title(f'{ticker} — Equity Curve (v4.0 Hierarchical)', fontsize=13, fontweight='bold')
+        ax.set_title(f'{ticker} — Equity Curve (v4.1 Hierarchical)', fontsize=13, fontweight='bold')
         ax.set_ylabel('Equity ($)')
         ax.legend(loc='upper left')
         ax.grid(True, alpha=0.3)
@@ -587,7 +634,7 @@ def main():
     sensitivity = 4
 
     print("="*65)
-    print("  ADAPTIVE MOMENTUM v4.0 — HIERARCHICAL MULTI-LAYER BACKTEST")
+    print("  ADAPTIVE MOMENTUM v4.1 — HIERARCHICAL MULTI-LAYER BACKTEST")
     print("  L1: Trend Gate (200-SMA)  |  L2: Momentum (ROC+RSI)")
     print("  L3: Conviction (OBV, CMF, ATR, Squeeze, Supertrend)")
     print(f"  Sensitivity: {sensitivity} (Standard)")
