@@ -125,10 +125,9 @@ class HierarchicalMomentumStrategy:
         7: (0.6, 0.4),
     }
 
-    # Adaptive score smoothing: only at high sensitivity where noise is present
-    # Sens 1-3 are already selective, smoothing hurts their performance
-    # Period 2 at Sens 4 gives same hit rate as period 3 with better returns
-    SMOOTH_PERIOD = {1: 1, 2: 1, 3: 1, 4: 2, 5: 3, 6: 3, 7: 4}
+    # Base score smoothing periods (before volatility adjustment)
+    # Low vol assets (SPY) get +3, moderate +1, high vol (BTC) +0
+    SMOOTH_PERIOD = {1: 1, 2: 2, 3: 1, 4: 2, 5: 3, 6: 3, 7: 4}
 
     # Zone hysteresis spread: 0 at low sensitivity (already well-filtered),
     # 0.5 at moderate-high sensitivity (prevents rapid zone flipping)
@@ -316,10 +315,19 @@ class HierarchicalMomentumStrategy:
         # ═══════════════════════════════════════
         # COMPOSITE SCORE SMOOTHING
         # ═══════════════════════════════════════
-        # Adaptive EMA smoothing reduces noise-driven zone flips
-        # Period scales with sensitivity (1=off at low sens, 3-4 at high sens)
-        if self.score_smooth_period > 1:
-            composite = calc_ema(composite, self.score_smooth_period).clip(0.0, 10.0)
+        # Volatility-adaptive smoothing: low-vol assets need more smoothing
+        # (more noise in score), high-vol assets need less (signals are clearer)
+        stable_atr_pct = median_atr_pct.dropna()
+        if len(stable_atr_pct) > 0:
+            med_atr = stable_atr_pct.iloc[-1]
+        else:
+            med_atr = atr_pct.median()
+
+        smooth_adjust = 3 if med_atr < 1.5 else (1 if med_atr < 2.5 else 0)
+        effective_smooth = self.score_smooth_period + smooth_adjust
+
+        if effective_smooth > 1:
+            composite = calc_ema(composite, effective_smooth).clip(0.0, 10.0)
 
         # ═══════════════════════════════════════
         # SIGNAL GENERATION
