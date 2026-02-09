@@ -12,19 +12,30 @@ indicator(title="Quantum Edge v2", shorttitle="QE2", overlay=true, max_bars_back
 // =============================================================================
 // INPUTS
 // =============================================================================
-group_signal = "Signal Settings"
-buyConfirmMin = input.int(3, "Buy Confirmations Needed (1-4)", minval=1, maxval=4, group=group_signal, tooltip="How many of the 4 confirmation conditions must pass.\n3 = high confidence (recommended)\n2 = more signals\n4 = very rare, highest conviction")
-sellConfirmMin = input.int(2, "Sell Confirmations Needed (1-4)", minval=1, maxval=4, group=group_signal, tooltip="How many sell confirmations needed.\n2 = recommended (catches most peaks)\n3 = rare but very high conviction")
-buyCooldown = input.int(10, "Buy Cooldown (bars)", minval=3, maxval=30, group=group_signal, tooltip="Minimum bars between buy signals")
-sellCooldown = input.int(15, "Sell Cooldown (bars)", minval=5, maxval=40, group=group_signal, tooltip="Minimum bars between sell signals")
+group_strength = "Signal Strength"
+strengthInput = input.string("3 — Moderate", "Strength", options=["1 — Ultra Conservative", "2 — Conservative", "3 — Moderate", "4 — Balanced", "5 — Liberal"], group=group_strength, tooltip="Controls how many signals appear and how strict the filters are.\n\n1 Ultra Conservative: Fewest signals, highest accuracy (4/4 confirms, long cooldowns)\n2 Conservative: High accuracy, reasonable count (3/4 confirms)\n3 Moderate: Balanced — recommended default (3/4 buy, 2/4 sell)\n4 Balanced: More signals, still filtered (2/4 confirms)\n5 Liberal: Most signals, lower accuracy (1/4 confirms)")
+
+// Derive strength level
+strengthLevel = strengthInput == "1 — Ultra Conservative" ? 1 : strengthInput == "2 — Conservative" ? 2 : strengthInput == "3 — Moderate" ? 3 : strengthInput == "4 — Balanced" ? 4 : 5
+
+// Map strength to parameters:
+//                          UltraCon  Conserv  Moderate  Balanced  Liberal
+// Buy Confirms (of 4):       4         3         3         2        1
+// Sell Confirms (of 4):      3         3         2         2        1
+// Buy Cooldown (bars):       20        15        10        5        5
+// Sell Cooldown (bars):      25        20        15        10       10
+// Pullback Sensitivity:      7         5         5         5        3
+// Extension Sensitivity:     10        8         8         8        5
+buyConfirmMin = strengthLevel == 1 ? 4 : strengthLevel == 2 ? 3 : strengthLevel == 3 ? 3 : strengthLevel == 4 ? 2 : 1
+sellConfirmMin = strengthLevel == 1 ? 3 : strengthLevel == 2 ? 3 : strengthLevel == 3 ? 2 : strengthLevel == 4 ? 2 : 1
+buyCooldown = strengthLevel == 1 ? 20 : strengthLevel == 2 ? 15 : strengthLevel == 3 ? 10 : 5
+sellCooldown = strengthLevel == 1 ? 25 : strengthLevel == 2 ? 20 : strengthLevel == 3 ? 15 : 10
+pullbackPct = strengthLevel == 1 ? 7.0 : strengthLevel <= 4 ? 5.0 : 3.0
+extensionPct = strengthLevel == 1 ? 10.0 : strengthLevel <= 4 ? 8.0 : 5.0
 
 group_pullback = "Pullback Detection"
-pullbackPct = input.float(5.0, "Pullback Sensitivity", minval=2.0, maxval=20.0, step=0.5, group=group_pullback, tooltip="Base pullback percentage (auto-adjusts to volatility via ATR).\n5 = default, lower = more triggers, higher = deeper dips only")
 pullbackLookback = input.int(20, "Lookback Period", minval=10, maxval=50, group=group_pullback)
 useATRAdapt = input.bool(true, "ATR-Adaptive Thresholds", group=group_pullback, tooltip="Auto-adjusts pullback/extension thresholds based on asset volatility.\nCritical for cross-asset compatibility (crypto vs stocks).")
-
-group_sell = "Sell Detection"
-extensionPct = input.float(8.0, "Extension Sensitivity", minval=3.0, maxval=25.0, step=0.5, group=group_sell, tooltip="How far above SMA200 price must be to trigger sell consideration.\nAuto-adjusts with ATR if adaptive mode is on.")
 
 group_technical = "Technical Parameters"
 rsiLen = input.int(14, "RSI Length", minval=7, maxval=30, group=group_technical)
@@ -238,7 +249,8 @@ plot(smaSlow, color=color.new(#9E9E9E, 50), linewidth=1, title="SMA 200")
 // =============================================================================
 if showDashboard and barstate.islast
     var table dash = table.new(position.top_right, 2, 10, border_width=1, border_color=color.new(#37474F, 0), bgcolor=color.new(#263238, 0))
-    table.cell(dash, 0, 0, "QUANTUM EDGE v2", bgcolor=color.new(#1565C0, 0), text_color=color.white, text_size=size.small)
+    strengthLabel = strengthLevel == 1 ? "ULTRA CON" : strengthLevel == 2 ? "CONSERV" : strengthLevel == 3 ? "MODERATE" : strengthLevel == 4 ? "BALANCED" : "LIBERAL"
+    table.cell(dash, 0, 0, "QE v2 [" + strengthLabel + "]", bgcolor=color.new(#1565C0, 0), text_color=color.white, text_size=size.small)
     table.cell(dash, 1, 0, "STATUS", bgcolor=color.new(#1565C0, 0), text_color=color.white, text_size=size.small)
     table.cell(dash, 0, 1, "Buy Confirms", bgcolor=color.new(#263238, 0), text_color=color.white, text_size=size.tiny)
     table.cell(dash, 1, 1, str.tostring(buyConfirmCount) + "/4", bgcolor=buyConfirmCount >= buyConfirmMin ? color.new(#10B981, 20) : color.new(#EF4444, 20), text_color=color.white, text_size=size.tiny)
