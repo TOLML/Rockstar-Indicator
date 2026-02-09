@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-Quantum Edge — Core Signal Backtest & Parameter Sweep
-=====================================================
-Replicates the weighted scoring signal system from the QE PineScript indicator.
-Sweeps key parameters to find conservative long-term timing settings.
+Quantum Edge v2 — Event-Based High-Confidence Backtest
+=======================================================
+Redesigned signal system:
+  - Event-based: triggers on TRANSITIONS, not states
+  - Buy = meaningful pullback + reversal confirmation
+  - Sell = extended peak + exhaustion confirmation
+  - Independent signals (multiple buys/sells in a row OK)
+  - Measures forward accuracy at multiple horizons
 """
 
 import numpy as np
@@ -16,59 +20,40 @@ warnings.filterwarnings('ignore')
 # INDICATOR CALCULATIONS
 # ═══════════════════════════════════════════
 
-def calc_sma(series, period):
-    return series.rolling(window=period, min_periods=period).mean()
+def calc_sma(s, p):
+    return s.rolling(window=p, min_periods=p).mean()
 
+def calc_ema(s, p):
+    return s.ewm(span=p, adjust=False).mean()
 
-def calc_ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
-
-
-def calc_atr(high, low, close, period=14):
-    tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/period, min_periods=period).mean()
-
-
-def calc_rsi(series, period=14):
-    delta = series.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
-    avg_gain = gain.ewm(alpha=1/period, min_periods=period).mean()
-    avg_loss = loss.ewm(alpha=1/period, min_periods=period).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
+def calc_rsi(s, p=14):
+    d = s.diff()
+    g = d.where(d > 0, 0.0)
+    l = -d.where(d < 0, 0.0)
+    ag = g.ewm(alpha=1/p, min_periods=p).mean()
+    al = l.ewm(alpha=1/p, min_periods=p).mean()
+    rs = ag / al.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
+def calc_atr(high, low, close, p=14):
+    tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/p, min_periods=p).mean()
 
-def calc_adx(high, low, close, period=14):
-    """Calculate ADX (Average Directional Index)."""
-    plus_dm = high.diff()
-    minus_dm = -low.diff()
-    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
-    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
-
-    atr = calc_atr(high, low, close, period)
-    plus_di = 100 * calc_ema(plus_dm, period) / atr.replace(0, np.nan)
-    minus_di = 100 * calc_ema(minus_dm, period) / atr.replace(0, np.nan)
-
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    adx = calc_ema(dx.fillna(0), period)
-    return adx, plus_di, minus_di
-
+def calc_stoch(close, high, low, p=14, smooth_k=3):
+    ll = low.rolling(p).min()
+    hh = high.rolling(p).max()
+    k = (100 * (close - ll) / (hh - ll).replace(0, np.nan)).fillna(50)
+    d = k.rolling(smooth_k).mean()
+    return k, d
 
 def calc_linreg(series, period):
-    """Linear regression value (equivalent to ta.linreg(source, length, 0))."""
     def _lr(x):
         n = len(x)
         if n < 2:
             return np.nan
         xi = np.arange(n, dtype=float)
-        sx = xi.sum()
-        sy = x.sum()
-        sxy = (xi * x).sum()
-        sx2 = (xi * xi).sum()
+        sx, sy = xi.sum(), x.sum()
+        sxy, sx2 = (xi * x).sum(), (xi * xi).sum()
         denom = n * sx2 - sx * sx
         if abs(denom) < 1e-10:
             return x[-1]
@@ -77,304 +62,328 @@ def calc_linreg(series, period):
         return intercept + slope * (n - 1)
     return series.rolling(window=period, min_periods=period).apply(_lr, raw=True)
 
-
-def calc_stochastic(close, high, low, period=14):
-    lowest_low = low.rolling(period).min()
-    highest_high = high.rolling(period).max()
-    denom = (highest_high - lowest_low).replace(0, np.nan)
-    k = 100 * (close - lowest_low) / denom
-    return k.fillna(50)
+def calc_obv(close, volume):
+    sign = np.sign(close.diff()).fillna(0)
+    return (sign * volume).cumsum()
 
 
 # ═══════════════════════════════════════════
-# QUANTUM EDGE SIGNAL ENGINE
+# EVENT-BASED SIGNAL ENGINE
 # ═══════════════════════════════════════════
 
-class QuantumEdgeStrategy:
+class QEv2:
+    """
+    Event-based system: detects TRANSITIONS not states.
+
+    Buy = pullback event + reversal confirmation + context
+    Sell = extension event + exhaustion confirmation + context
+
+    Tier system (all tiers must pass):
+      Tier 1: Entry event (required trigger)
+      Tier 2: Confirmation (at least N of M)
+      Tier 3: Context (at least 1)
+    """
 
     def __init__(self,
-                 # Signal thresholds
-                 buy_threshold=60.0, sell_threshold=60.0,
-                 elite_buy_threshold=85.0, elite_sell_threshold=85.0,
-                 # Filter weights
-                 squeeze_weight=25.0, rsi_weight=20.0,
-                 trend_weight=20.0, volume_weight=15.0,
-                 adx_weight=10.0, stoch_weight=10.0,
-                 # Technical parameters
-                 bb_len=20, bb_mult=2.0,
-                 kc_len=20, kc_mult=1.5,
-                 rsi_len=14, rsi_buy_level=35, rsi_sell_level=65,
-                 ema_length=50,
-                 adx_length=14, adx_threshold=18,
-                 volume_mult=1.7,
-                 stoch_len=14, stoch_buy=25, stoch_sell=75,
-                 squeeze_min_duration=3,
-                 # Signal controls
-                 confirmation_bars=2, signal_cooldown=5,
-                 # Costs
-                 commission_pct=0.1, slippage_pct=0.05):
-        self.buy_threshold = buy_threshold
-        self.sell_threshold = sell_threshold
-        self.elite_buy_threshold = elite_buy_threshold
-        self.elite_sell_threshold = elite_sell_threshold
-        self.squeeze_weight = squeeze_weight
-        self.rsi_weight = rsi_weight
-        self.trend_weight = trend_weight
-        self.volume_weight = volume_weight
-        self.adx_weight = adx_weight
-        self.stoch_weight = stoch_weight
+                 # Pullback detection
+                 pullback_pct=5.0,       # min % drop from recent high for buy
+                 pullback_lookback=20,   # bars to look back for recent high
+                 # Extension detection
+                 extension_pct=8.0,      # min % above SMA for sell
+                 # RSI
+                 rsi_len=14,
+                 rsi_oversold=30,        # event: RSI was below this
+                 rsi_recovery=35,        # event: RSI crossed above this
+                 rsi_overbought=70,      # event: RSI was above this
+                 rsi_exhaustion=65,      # event: RSI crossed below this
+                 # Stochastic
+                 stoch_len=14,
+                 stoch_oversold=20,      # event threshold
+                 stoch_overbought=80,
+                 # Squeeze
+                 bb_len=20, bb_mult=2.0, kc_len=20, kc_mult=1.5,
+                 squeeze_min_bars=3,
+                 # Moving averages
+                 sma_slow=200,
+                 ema_fast=50,
+                 # Volume
+                 vol_mult=1.3,
+                 # Confirmation thresholds
+                 buy_confirm_min=2,      # min confirmations (out of 4)
+                 sell_confirm_min=2,     # min confirmations (out of 4)
+                 # Cooldown
+                 buy_cooldown=10,
+                 sell_cooldown=15,
+                 # Adaptivity (for crypto vs stocks)
+                 atr_normalize=True):    # auto-adapt pullback to volatility
+        self.pullback_pct = pullback_pct
+        self.pullback_lookback = pullback_lookback
+        self.extension_pct = extension_pct
+        self.rsi_len = rsi_len
+        self.rsi_oversold = rsi_oversold
+        self.rsi_recovery = rsi_recovery
+        self.rsi_overbought = rsi_overbought
+        self.rsi_exhaustion = rsi_exhaustion
+        self.stoch_len = stoch_len
+        self.stoch_oversold = stoch_oversold
+        self.stoch_overbought = stoch_overbought
         self.bb_len = bb_len
         self.bb_mult = bb_mult
         self.kc_len = kc_len
         self.kc_mult = kc_mult
-        self.rsi_len = rsi_len
-        self.rsi_buy_level = rsi_buy_level
-        self.rsi_sell_level = rsi_sell_level
-        self.ema_length = ema_length
-        self.adx_length = adx_length
-        self.adx_threshold = adx_threshold
-        self.volume_mult = volume_mult
-        self.stoch_len = stoch_len
-        self.stoch_buy = stoch_buy
-        self.stoch_sell = stoch_sell
-        self.squeeze_min_duration = squeeze_min_duration
-        self.confirmation_bars = confirmation_bars
-        self.signal_cooldown = signal_cooldown
-        self.commission_pct = commission_pct
-        self.slippage_pct = slippage_pct
+        self.squeeze_min_bars = squeeze_min_bars
+        self.sma_slow = sma_slow
+        self.ema_fast = ema_fast
+        self.vol_mult = vol_mult
+        self.buy_confirm_min = buy_confirm_min
+        self.sell_confirm_min = sell_confirm_min
+        self.buy_cooldown = buy_cooldown
+        self.sell_cooldown = sell_cooldown
+        self.atr_normalize = atr_normalize
 
-    def compute_signals(self, df):
-        close = df['Close']
-        high = df['High']
-        low = df['Low']
-        volume = df['Volume'].fillna(0)
+    def compute(self, df):
+        c = df['Close']
+        h = df['High']
+        lo = df['Low']
+        v = df['Volume'].fillna(0)
         n = len(df)
 
-        # ── Bollinger Bands ──
-        bb_basis = calc_sma(close, self.bb_len)
-        bb_std = close.rolling(self.bb_len).std()
+        # ── Core indicators ──
+        rsi = calc_rsi(c, self.rsi_len)
+        stoch_k, stoch_d = calc_stoch(c, h, lo, self.stoch_len)
+        sma_slow = calc_sma(c, self.sma_slow)
+        ema_fast = calc_ema(c, self.ema_fast)
+        atr = calc_atr(h, lo, c, 14)
+        obv = calc_obv(c, v)
+        obv_ma = calc_sma(obv, 20)
+        avg_vol = calc_sma(v, 20)
+
+        # ── Bollinger + Keltner → Squeeze ──
+        bb_basis = calc_sma(c, self.bb_len)
+        bb_std = c.rolling(self.bb_len).std()
         bb_upper = bb_basis + self.bb_mult * bb_std
         bb_lower = bb_basis - self.bb_mult * bb_std
-
-        # ── Keltner Channels ──
-        kc_basis = calc_sma(close, self.kc_len)
-        tr = pd.concat([high - low,
-                        (high - close.shift(1)).abs(),
-                        (low - close.shift(1)).abs()], axis=1).max(axis=1)
+        kc_basis = calc_sma(c, self.kc_len)
+        tr = pd.concat([h - lo, (h - c.shift(1)).abs(), (lo - c.shift(1)).abs()], axis=1).max(axis=1)
         kc_range = calc_sma(tr, self.kc_len)
         kc_upper = kc_basis + kc_range * self.kc_mult
         kc_lower = kc_basis - kc_range * self.kc_mult
 
-        # ── Squeeze Detection ──
         sqz_on = (bb_lower > kc_lower) & (bb_upper < kc_upper)
         sqz_off = (bb_lower < kc_lower) & (bb_upper > kc_upper)
 
-        # Squeeze duration
         sqz_count = np.zeros(n)
         for i in range(1, n):
-            if sqz_on.iloc[i]:
-                sqz_count[i] = sqz_count[i-1] + 1
-            else:
-                sqz_count[i] = 0
-
-        # Squeeze release
-        sqz_release = np.zeros(n, dtype=bool)
+            sqz_count[i] = sqz_count[i-1] + 1 if sqz_on.iloc[i] else 0
+        sqz_release = pd.Series(np.zeros(n, dtype=bool), index=df.index)
         for i in range(1, n):
-            sqz_release[i] = (sqz_on.iloc[i-1] and sqz_off.iloc[i]
-                              and sqz_count[i-1] >= self.squeeze_min_duration)
+            sqz_release.iloc[i] = sqz_on.iloc[i-1] and sqz_off.iloc[i] and sqz_count[i-1] >= self.squeeze_min_bars
 
-        # ── Squeeze Momentum (linreg) ──
-        highest_h = high.rolling(self.kc_len).max()
-        lowest_l = low.rolling(self.kc_len).min()
-        avg1 = (highest_h + lowest_l) / 2
-        avg2 = calc_sma(close, self.kc_len)
-        sqz_source = close - (avg1 + avg2) / 2
-        sqz_mom = calc_linreg(sqz_source, self.kc_len)
+        # Squeeze momentum
+        hh_kc = h.rolling(self.kc_len).max()
+        ll_kc = lo.rolling(self.kc_len).min()
+        sqz_src = c - ((hh_kc + ll_kc) / 2 + calc_sma(c, self.kc_len)) / 2
+        sqz_mom = calc_linreg(sqz_src, self.kc_len)
+        mom_increasing = sqz_mom > sqz_mom.shift(1)
 
-        mom_up = sqz_mom > 0
-        mom_down = sqz_mom < 0
+        # ── Derived signals ──
+        recent_high = h.rolling(self.pullback_lookback).max()
+        drawdown_from_high = (recent_high - c) / recent_high * 100
 
-        # ── RSI ──
-        rsi = calc_rsi(close, self.rsi_len)
-        rsi_buy = rsi < self.rsi_buy_level
-        rsi_sell = rsi > self.rsi_sell_level
+        # Auto-adapt pullback threshold to asset volatility
+        if self.atr_normalize:
+            avg_atr_pct = (atr / c * 100).rolling(50).mean().fillna(self.pullback_pct)
+            adaptive_pullback = (avg_atr_pct * self.pullback_pct / 2).clip(lower=2.0, upper=25.0)
+        else:
+            adaptive_pullback = pd.Series(self.pullback_pct, index=df.index)
 
-        # ── EMA Trend ──
-        ema = calc_ema(close, self.ema_length)
-        above_ema = close > ema * 0.98  # 2% tolerance for buy
-        below_ema = close < ema * 1.02  # 2% tolerance for sell
-
-        # ── Volume Spike ──
-        avg_vol = calc_sma(volume, 20)
-        vol_spike = volume > avg_vol * self.volume_mult
-
-        # ── ADX ──
-        adx, _, _ = calc_adx(high, low, close, self.adx_length)
-        strong_trend = adx > self.adx_threshold
-
-        # ── Stochastic ──
-        stoch = calc_stochastic(close, high, low, self.stoch_len)
-        stoch_buy = stoch < self.stoch_buy
-        stoch_sell = stoch > self.stoch_sell
+        pct_from_sma = ((c - sma_slow) / sma_slow * 100).fillna(0)
 
         # ═══════════════════════════════════════
-        # WEIGHTED SCORING
+        # BUY EVENT DETECTION
         # ═══════════════════════════════════════
-        core_total = (self.squeeze_weight + self.rsi_weight +
-                      self.volume_weight + self.trend_weight + self.adx_weight)
-        elite_total = core_total + self.stoch_weight
 
-        sqz_release_s = pd.Series(sqz_release, index=df.index)
-        sqz_off_s = sqz_off
+        # Tier 1: TRIGGER EVENT (at least one must fire)
+        # A) Meaningful pullback: price dropped >= X% from recent high
+        pullback_event = drawdown_from_high >= adaptive_pullback
 
-        # Core buy score components
-        squeeze_buy = ((sqz_release_s & mom_down) | (sqz_off_s & mom_down))
-        core_buy_score = (
-            squeeze_buy.astype(float) * self.squeeze_weight +
-            rsi_buy.astype(float) * self.rsi_weight +
-            vol_spike.astype(float) * self.volume_weight +
-            above_ema.astype(float) * self.trend_weight +
-            strong_trend.astype(float) * self.adx_weight
-        )
-        core_buy_pct = (core_buy_score / core_total * 100).fillna(0)
+        # B) SMA200 bounce: price was below SMA200, now crossing back above
+        sma_bounce = (c.shift(1) < sma_slow.shift(1)) & (c >= sma_slow)
 
-        # Core sell score components
-        squeeze_sell = ((sqz_release_s & mom_up) | (sqz_off_s & mom_up))
-        core_sell_score = (
-            squeeze_sell.astype(float) * self.squeeze_weight +
-            rsi_sell.astype(float) * self.rsi_weight +
-            vol_spike.astype(float) * self.volume_weight +
-            below_ema.astype(float) * self.trend_weight +
-            strong_trend.astype(float) * self.adx_weight
-        )
-        core_sell_pct = (core_sell_score / core_total * 100).fillna(0)
+        # C) Squeeze release with upward momentum
+        squeeze_release_up = sqz_release & mom_increasing
 
-        # Elite scores (add stochastic)
-        elite_buy_score = core_buy_score + stoch_buy.astype(float) * self.stoch_weight
-        elite_buy_pct = (elite_buy_score / elite_total * 100).fillna(0)
-        elite_sell_score = core_sell_score + stoch_sell.astype(float) * self.stoch_weight
-        elite_sell_pct = (elite_sell_score / elite_total * 100).fillna(0)
+        buy_trigger = pullback_event | sma_bounce | squeeze_release_up
+
+        # Tier 2: CONFIRMATION (at least N of 4)
+        # Must confirm the pullback is reversing, not continuing
+        rsi_was_oversold = rsi.rolling(5).min() < self.rsi_oversold
+        rsi_recovering = (rsi > self.rsi_recovery) & rsi_was_oversold
+
+        stoch_reversal = (stoch_k > stoch_d) & (stoch_k.shift(1) <= stoch_d.shift(1)) & (stoch_k < 50)
+
+        momentum_turn = mom_increasing & (sqz_mom < 0)
+
+        vol_confirm = v > avg_vol * self.vol_mult
+
+        buy_confirmations = (rsi_recovering.astype(int) +
+                            stoch_reversal.astype(int) +
+                            momentum_turn.astype(int) +
+                            vol_confirm.astype(int))
+
+        # Tier 3: CONTEXT (at least one)
+        trend_ok = c > sma_slow * 0.90  # long-term trend not broken
+        obv_bullish = obv > obv_ma       # accumulation
+        near_ema = c < ema_fast * 1.02   # near/below fast EMA (not extended)
+
+        buy_context = trend_ok | obv_bullish | near_ema
+
+        # Combine all tiers
+        buy_raw = buy_trigger & (buy_confirmations >= self.buy_confirm_min) & buy_context
+
+        # Strong buy: trigger + 3+ confirmations + multiple context
+        strong_buy_raw = buy_trigger & (buy_confirmations >= 3) & (trend_ok & (obv_bullish | near_ema))
 
         # ═══════════════════════════════════════
-        # SIGNAL GENERATION WITH CONFIRMATION + COOLDOWN
+        # SELL EVENT DETECTION
         # ═══════════════════════════════════════
-        buy_raw = core_buy_pct >= self.buy_threshold
-        sell_raw = core_sell_pct >= self.sell_threshold
-        elite_buy_raw = elite_buy_pct >= self.elite_buy_threshold
-        elite_sell_raw = elite_sell_pct >= self.elite_sell_threshold
 
-        # Confirmation: signal must persist for N bars
-        buy_conf = buy_raw.copy()
-        sell_conf = sell_raw.copy()
-        elite_buy_conf = elite_buy_raw.copy()
-        elite_sell_conf = elite_sell_raw.copy()
-        if self.confirmation_bars > 1:
-            for lag in range(1, self.confirmation_bars):
-                buy_conf = buy_conf & buy_raw.shift(lag).fillna(False)
-                sell_conf = sell_conf & sell_raw.shift(lag).fillna(False)
-                elite_buy_conf = elite_buy_conf & elite_buy_raw.shift(lag).fillna(False)
-                elite_sell_conf = elite_sell_conf & elite_sell_raw.shift(lag).fillna(False)
+        # Tier 1: TRIGGER EVENT
+        # A) Price significantly extended above SMA200
+        if self.atr_normalize:
+            adaptive_extension = (avg_atr_pct * self.extension_pct / 2).clip(lower=3.0, upper=30.0)
+        else:
+            adaptive_extension = pd.Series(self.extension_pct, index=df.index)
+        extended_event = pct_from_sma > adaptive_extension
 
-        # Apply cooldown
-        buy_arr = buy_conf.values.astype(bool)
-        sell_arr = sell_conf.values.astype(bool)
-        eb_arr = elite_buy_conf.values.astype(bool)
-        es_arr = elite_sell_conf.values.astype(bool)
-        close_arr = close.values
+        # B) RSI was overbought and crossing back down
+        rsi_was_overbought = rsi.rolling(5).max() > self.rsi_overbought
+        rsi_exhausting = (rsi < self.rsi_exhaustion) & rsi_was_overbought
 
-        sig_out = np.zeros(n, dtype=np.int8)
-        last_buy_bar = -999
-        last_sell_bar = -999
+        sell_trigger = extended_event | rsi_exhausting
+
+        # Tier 2: CONFIRMATION (at least N of 4)
+        rsi_declining = (rsi < rsi.shift(1)) & (rsi.shift(1) < rsi.shift(2)) & (rsi > 50)  # 2 bars declining
+
+        stoch_cross_down = (stoch_k < stoch_d) & (stoch_k.shift(1) >= stoch_d.shift(1)) & (stoch_k > 50)
+
+        momentum_fade = (sqz_mom < sqz_mom.shift(1)) & (sqz_mom > 0)  # losing steam from positive
+
+        vol_dist = v > avg_vol * (self.vol_mult * 1.3)  # higher threshold for sells
+
+        sell_confirmations = (rsi_declining.astype(int) +
+                             stoch_cross_down.astype(int) +
+                             momentum_fade.astype(int) +
+                             vol_dist.astype(int))
+
+        # Tier 3: CONTEXT
+        above_sma = c > sma_slow  # must be above SMA to sell
+        obv_bearish = obv < obv_ma
+
+        sell_context = above_sma
+
+        sell_raw = sell_trigger & (sell_confirmations >= self.sell_confirm_min) & sell_context
+
+        strong_sell_raw = sell_trigger & (sell_confirmations >= 3) & sell_context & obv_bearish
+
+        # ═══════════════════════════════════════
+        # COOLDOWN
+        # ═══════════════════════════════════════
+        buy_a = buy_raw.values.astype(bool)
+        sbuy_a = strong_buy_raw.values.astype(bool)
+        sell_a = sell_raw.values.astype(bool)
+        ssell_a = strong_sell_raw.values.astype(bool)
+
+        final_buy = np.zeros(n, dtype=np.int8)
+        final_sell = np.zeros(n, dtype=np.int8)
+        last_buy = -999
+        last_sell = -999
 
         for i in range(n):
-            buy_ok = buy_arr[i] and (i - last_buy_bar >= self.signal_cooldown)
-            sell_ok = sell_arr[i] and (i - last_sell_bar >= self.signal_cooldown)
+            if buy_a[i] and (i - last_buy >= self.buy_cooldown):
+                final_buy[i] = 2 if sbuy_a[i] else 1
+                last_buy = i
+            if sell_a[i] and (i - last_sell >= self.sell_cooldown):
+                final_sell[i] = 2 if ssell_a[i] else 1
+                last_sell = i
 
-            # Elite overrides standard
-            if eb_arr[i] and (i - last_buy_bar >= self.signal_cooldown):
-                buy_ok = True
-            if es_arr[i] and (i - last_sell_bar >= self.signal_cooldown):
-                sell_ok = True
-
-            if buy_ok and not sell_ok:
-                sig_out[i] = 1
-                last_buy_bar = i
-            elif sell_ok and not buy_ok:
-                sig_out[i] = -1
-                last_sell_bar = i
-
-        signals = pd.Series(sig_out, index=df.index)
-        return signals, core_buy_pct, core_sell_pct
+        return (pd.Series(final_buy, index=df.index),
+                pd.Series(final_sell, index=df.index),
+                buy_confirmations, sell_confirmations)
 
 
 # ═══════════════════════════════════════════
-# BACKTESTING ENGINE
+# ACCURACY MEASUREMENT
 # ═══════════════════════════════════════════
 
-def backtest(df, signals, commission_pct=0.1, slippage_pct=0.05):
+def measure_accuracy(df, buys, sells):
     c = df['Close'].values
-    n = len(df)
-    sig_arr = signals.values
-    cost_pct = (commission_pct + slippage_pct) / 100
+    lo = df['Low'].values
+    hi = df['High'].values
+    n = len(c)
+    horizons = [5, 13, 26, 52]
 
-    equity = 100000.0
-    peak_equity = equity
-    position = 0
-    entry_price = 0.0
-    trades = []
-    max_dd = 0.0
+    results = {}
 
-    for i in range(1, n):
-        if position == 1:
-            equity *= c[i] / c[i-1] if c[i-1] > 0 else 1.0
+    for label, sig, direction in [('BUY', buys, 1), ('SELL', sells, -1)]:
+        locs = np.where(sig.values > 0)[0]
+        strong_locs = np.where(sig.values >= 2)[0]
+        results[f'{label}_total'] = len(locs)
+        results[f'{label}_strong'] = len(strong_locs)
 
-        if equity > peak_equity:
-            peak_equity = equity
-        dd = (peak_equity - equity) / peak_equity * 100
-        if dd > max_dd:
-            max_dd = dd
+        for h in horizons:
+            valid = locs[locs + h < n]
+            if len(valid) == 0:
+                results[f'{label}_acc_{h}'] = 0.0
+                results[f'{label}_ret_{h}'] = 0.0
+                continue
+            fwd = (c[valid + h] - c[valid]) / c[valid] * 100
+            if direction == 1:
+                results[f'{label}_acc_{h}'] = float((fwd > 0).sum()) / len(valid) * 100
+            else:
+                results[f'{label}_acc_{h}'] = float((fwd < 0).sum()) / len(valid) * 100
+            results[f'{label}_ret_{h}'] = float(fwd.mean()) * direction
 
-        sig = sig_arr[i]
-        if sig == 1 and position == 0:
-            equity -= equity * cost_pct
-            entry_price = c[i]
-            position = 1
-        elif sig == -1 and position == 1:
-            equity -= equity * cost_pct
-            trades.append((c[i] - entry_price) / entry_price * 100)
-            position = 0
+        for h in horizons:
+            valid = strong_locs[strong_locs + h < n]
+            if len(valid) == 0:
+                results[f'{label}_strong_acc_{h}'] = 0.0
+                continue
+            fwd = (c[valid + h] - c[valid]) / c[valid] * 100
+            if direction == 1:
+                results[f'{label}_strong_acc_{h}'] = float((fwd > 0).sum()) / len(valid) * 100
+            else:
+                results[f'{label}_strong_acc_{h}'] = float((fwd < 0).sum()) / len(valid) * 100
 
-    trade_arr = np.array(trades) if trades else np.array([])
-    total = len(trade_arr)
-    if total > 0:
-        wins = int((trade_arr >= 0).sum())
-        losses = total - wins
-        win_rate = wins / total * 100
-        pf_win = float(trade_arr[trade_arr >= 0].sum()) if wins > 0 else 0
-        pf_loss = abs(float(trade_arr[trade_arr < 0].sum())) if losses > 0 else 0
-        profit_factor = pf_win / pf_loss if pf_loss > 0 else 999
-    else:
-        wins = losses = 0
-        win_rate = 0
-        profit_factor = 0
+        # Sell: also measure "did price dip at least 3% within N bars?"
+        if direction == -1:
+            for h in horizons:
+                valid = locs[locs + h < n]
+                if len(valid) == 0:
+                    results[f'{label}_dip3_{h}'] = 0.0
+                    continue
+                dipped = np.zeros(len(valid), dtype=bool)
+                for j, idx in enumerate(valid):
+                    end = min(idx + h, n - 1)
+                    min_price = lo[idx+1:end+1].min() if idx+1 <= end else c[idx]
+                    dipped[j] = (c[idx] - min_price) / c[idx] * 100 >= 3.0
+                results[f'{label}_dip3_{h}'] = float(dipped.sum()) / len(valid) * 100
 
-    strat_return = (equity / 100000 - 1) * 100
+    return results
 
-    # Forward hit rates (13-bar)
-    buy_locs = np.where(sig_arr == 1)[0]
-    sell_locs = np.where(sig_arr == -1)[0]
-    valid_buy = buy_locs[buy_locs + 13 < n]
-    valid_sell = sell_locs[sell_locs + 13 < n]
-    buy_hit = int((c[valid_buy + 13] > c[valid_buy]).sum()) / len(valid_buy) * 100 if len(valid_buy) > 0 else 0
-    sell_hit = int((c[valid_sell + 13] < c[valid_sell]).sum()) / len(valid_sell) * 100 if len(valid_sell) > 0 else 0
 
-    return {
-        'trades': total, 'wins': wins, 'losses': losses,
-        'win_rate': win_rate, 'profit_factor': profit_factor,
-        'max_dd': max_dd, 'return_pct': strat_return,
-        'buy_hit_13': buy_hit, 'sell_hit_13': sell_hit,
-        'buy_signals': len(buy_locs), 'sell_signals': len(sell_locs),
-    }
+def print_result(label, r):
+    line = f"  {label:>30}  B:{r['BUY_total']:>3}({r['BUY_strong']:>2})"
+    line += f"  5d:{r['BUY_acc_5']:>4.0f}%  13d:{r['BUY_acc_13']:>4.0f}%  26d:{r['BUY_acc_26']:>4.0f}%  52d:{r['BUY_acc_52']:>4.0f}%"
+    line += f"  | S:{r['SELL_total']:>3}({r['SELL_strong']:>2})"
+    if r['SELL_total'] > 0:
+        line += f"  dip:{r.get('SELL_dip3_26',0):>3.0f}%"
+    # Stars
+    if r['BUY_total'] >= 3 and r['BUY_acc_13'] >= 65:
+        line += " ★"
+    if r['BUY_total'] >= 3 and r['BUY_acc_26'] >= 70:
+        line += "★"
+    print(line)
 
 
 # ═══════════════════════════════════════════
@@ -382,125 +391,131 @@ def backtest(df, signals, commission_pct=0.1, slippage_pct=0.05):
 # ═══════════════════════════════════════════
 
 def sweep(df, name):
-    print(f"\n{'='*75}")
-    print(f"  QUANTUM EDGE PARAMETER SWEEP — {name}")
-    print(f"{'='*75}")
+    print(f"\n{'='*95}")
+    print(f"  QUANTUM EDGE v2 — EVENT-BASED SIGNALS — {name}")
+    print(f"  Bars: {len(df)}  Period: {df.index[0].strftime('%Y-%m-%d')} to {df.index[-1].strftime('%Y-%m-%d')}")
+    print(f"{'='*95}")
 
-    # 1) Baseline with defaults
-    print(f"\n  ── BASELINE (Default Settings) ──")
-    strat = QuantumEdgeStrategy()
-    sigs, _, _ = strat.compute_signals(df)
-    res = backtest(df, sigs)
-    print(f"  Trades: {res['trades']:>3}  WR: {res['win_rate']:>5.1f}%  PF: {res['profit_factor']:>5.2f}  "
-          f"Return: {res['return_pct']:>9.1f}%  DD: {res['max_dd']:>5.1f}%  "
-          f"BuyHit: {res['buy_hit_13']:>5.1f}%  SellHit: {res['sell_hit_13']:>5.1f}%")
+    # ── 1. Pullback threshold ──
+    print(f"\n  ── PULLBACK THRESHOLD (adaptive ATR-normalized) ──")
+    print(f"  {'Config':>30}  {'B(str)':>8}  {'5d':>6}  {'13d':>7}  {'26d':>7}  {'52d':>7}  {'S(str)':>8}  {'dip3%':>6}")
+    for pb in [3, 5, 7, 10, 15]:
+        s = QEv2(pullback_pct=pb)
+        buys, sells, _, _ = s.compute(df)
+        r = measure_accuracy(df, buys, sells)
+        print_result(f"Pullback={pb}%", r)
 
-    # 2) Buy/Sell Threshold Sweep
-    print(f"\n  ── BUY/SELL THRESHOLD SWEEP ──")
-    print(f"  {'Thresh':>6}  {'Trades':>6}  {'WR%':>6}  {'PF':>6}  {'Return%':>10}  {'DD%':>6}  {'BuyHit%':>8}  {'SellHit%':>9}")
-    best_hr = {'val': 0, 'thresh': 0}
-    for thresh in [40, 50, 55, 60, 65, 70, 75, 80, 85, 90]:
-        s = QuantumEdgeStrategy(buy_threshold=thresh, sell_threshold=thresh)
-        sigs, _, _ = s.compute_signals(df)
-        r = backtest(df, sigs)
-        marker = ""
-        if r['trades'] > 0 and r['buy_hit_13'] > best_hr['val']:
-            best_hr = {'val': r['buy_hit_13'], 'thresh': thresh}
-        if r['trades'] > 0 and r['buy_hit_13'] >= 60:
-            marker = " ◄"
-        print(f"  {thresh:>6}  {r['trades']:>6}  {r['win_rate']:>5.1f}%  {r['profit_factor']:>5.2f}  "
-              f"{r['return_pct']:>9.1f}%  {r['max_dd']:>5.1f}%  {r['buy_hit_13']:>7.1f}%  {r['sell_hit_13']:>8.1f}%{marker}")
+    # ── 2. Confirmation threshold ──
+    print(f"\n  ── BUY CONFIRMATION THRESHOLD (out of 4) ──")
+    for bc in [1, 2, 3]:
+        s = QEv2(buy_confirm_min=bc)
+        buys, sells, _, _ = s.compute(df)
+        r = measure_accuracy(df, buys, sells)
+        print_result(f"BuyConfirm>={bc}", r)
 
-    # 3) Cooldown Sweep
-    print(f"\n  ── SIGNAL COOLDOWN SWEEP (thresh={best_hr['thresh']}) ──")
-    print(f"  {'Cool':>4}  {'Trades':>6}  {'WR%':>6}  {'PF':>6}  {'Return%':>10}  {'DD%':>6}  {'BuyHit%':>8}")
-    bt = best_hr['thresh'] if best_hr['thresh'] > 0 else 60
-    for cool in [3, 5, 8, 10, 15, 20, 25, 30]:
-        s = QuantumEdgeStrategy(buy_threshold=bt, sell_threshold=bt, signal_cooldown=cool)
-        sigs, _, _ = s.compute_signals(df)
-        r = backtest(df, sigs)
-        print(f"  {cool:>4}  {r['trades']:>6}  {r['win_rate']:>5.1f}%  {r['profit_factor']:>5.2f}  "
-              f"{r['return_pct']:>9.1f}%  {r['max_dd']:>5.1f}%  {r['buy_hit_13']:>7.1f}%")
+    # ── 3. RSI levels ──
+    print(f"\n  ── RSI OVERSOLD LEVEL ──")
+    for os_lvl, rec_lvl in [(25, 30), (30, 35), (35, 40), (40, 45)]:
+        s = QEv2(rsi_oversold=os_lvl, rsi_recovery=rec_lvl)
+        buys, sells, _, _ = s.compute(df)
+        r = measure_accuracy(df, buys, sells)
+        print_result(f"RSI_OS={os_lvl}, Rec={rec_lvl}", r)
 
-    # 4) RSI Level Sweep
-    print(f"\n  ── RSI LEVEL SWEEP (thresh={bt}, cool=5) ──")
-    print(f"  {'RSI_B':>5}  {'RSI_S':>5}  {'Trades':>6}  {'WR%':>6}  {'PF':>6}  {'Return%':>10}  {'BuyHit%':>8}")
-    for rsi_b, rsi_s in [(25, 75), (30, 70), (35, 65), (40, 60), (45, 55)]:
-        s = QuantumEdgeStrategy(buy_threshold=bt, sell_threshold=bt,
-                                rsi_buy_level=rsi_b, rsi_sell_level=rsi_s)
-        sigs, _, _ = s.compute_signals(df)
-        r = backtest(df, sigs)
-        print(f"  {rsi_b:>5}  {rsi_s:>5}  {r['trades']:>6}  {r['win_rate']:>5.1f}%  {r['profit_factor']:>5.2f}  "
-              f"{r['return_pct']:>9.1f}%  {r['buy_hit_13']:>7.1f}%")
+    # ── 4. SMA length ──
+    print(f"\n  ── SMA SLOW LENGTH ──")
+    for sma_l in [100, 150, 200, 250]:
+        s = QEv2(sma_slow=sma_l)
+        buys, sells, _, _ = s.compute(df)
+        r = measure_accuracy(df, buys, sells)
+        print_result(f"SMA={sma_l}", r)
 
-    # 5) EMA Length Sweep
-    print(f"\n  ── EMA LENGTH SWEEP (thresh={bt}) ──")
-    print(f"  {'EMA':>4}  {'Trades':>6}  {'WR%':>6}  {'PF':>6}  {'Return%':>10}  {'BuyHit%':>8}")
-    for ema_l in [20, 50, 100, 150, 200]:
-        s = QuantumEdgeStrategy(buy_threshold=bt, sell_threshold=bt, ema_length=ema_l)
-        sigs, _, _ = s.compute_signals(df)
-        r = backtest(df, sigs)
-        print(f"  {ema_l:>4}  {r['trades']:>6}  {r['win_rate']:>5.1f}%  {r['profit_factor']:>5.2f}  "
-              f"{r['return_pct']:>9.1f}%  {r['buy_hit_13']:>7.1f}%")
+    # ── 5. Cooldown ──
+    print(f"\n  ── COOLDOWN ──")
+    for bc, sc in [(5, 10), (10, 15), (10, 20), (15, 25), (20, 30)]:
+        s = QEv2(buy_cooldown=bc, sell_cooldown=sc)
+        buys, sells, _, _ = s.compute(df)
+        r = measure_accuracy(df, buys, sells)
+        print_result(f"BuyCool={bc}, SellCool={sc}", r)
 
-    # 6) Weight Tuning — heavier squeeze + trend
-    print(f"\n  ── WEIGHT CONFIGURATION SWEEP (thresh={bt}) ──")
-    print(f"  {'Config':>20}  {'Trades':>6}  {'WR%':>6}  {'PF':>6}  {'Return%':>10}  {'BuyHit%':>8}")
-    configs = [
-        ("Default 25/20/20/15/10", 25, 20, 20, 15, 10),
-        ("Heavy Squeeze 40/15/15/15/15", 40, 15, 15, 15, 15),
-        ("Heavy Trend 20/15/35/15/15", 20, 15, 35, 15, 15),
-        ("Squeeze+RSI 30/30/15/15/10", 30, 30, 15, 15, 10),
-        ("Squeeze+Trend 30/15/30/15/10", 30, 15, 30, 15, 10),
-        ("Equal 20/20/20/20/20", 20, 20, 20, 20, 20),
-        ("RSI+Trend 15/30/30/15/10", 15, 30, 30, 15, 10),
-    ]
-    for label, sw, rw, tw, vw, aw in configs:
-        s = QuantumEdgeStrategy(buy_threshold=bt, sell_threshold=bt,
-                                squeeze_weight=sw, rsi_weight=rw,
-                                trend_weight=tw, volume_weight=vw, adx_weight=aw)
-        sigs, _, _ = s.compute_signals(df)
-        r = backtest(df, sigs)
-        print(f"  {label:>20}  {r['trades']:>6}  {r['win_rate']:>5.1f}%  {r['profit_factor']:>5.2f}  "
-              f"{r['return_pct']:>9.1f}%  {r['buy_hit_13']:>7.1f}%")
+    # ── 6. Extension for sells ──
+    print(f"\n  ── SELL EXTENSION THRESHOLD ──")
+    for ext in [5, 8, 10, 15, 20]:
+        s = QEv2(extension_pct=ext)
+        buys, sells, _, _ = s.compute(df)
+        r = measure_accuracy(df, buys, sells)
+        print_result(f"SellExtension={ext}%", r)
 
-    # 7) Confirmation Bars Sweep
-    print(f"\n  ── CONFIRMATION BARS SWEEP (thresh={bt}) ──")
-    print(f"  {'Conf':>4}  {'Trades':>6}  {'WR%':>6}  {'PF':>6}  {'Return%':>10}  {'BuyHit%':>8}")
-    for cb in [1, 2, 3]:
-        s = QuantumEdgeStrategy(buy_threshold=bt, sell_threshold=bt, confirmation_bars=cb)
-        sigs, _, _ = s.compute_signals(df)
-        r = backtest(df, sigs)
-        print(f"  {cb:>4}  {r['trades']:>6}  {r['win_rate']:>5.1f}%  {r['profit_factor']:>5.2f}  "
-              f"{r['return_pct']:>9.1f}%  {r['buy_hit_13']:>7.1f}%")
+    # ── 7. Sell confirmation ──
+    print(f"\n  ── SELL CONFIRMATION THRESHOLD ──")
+    for sc in [1, 2, 3]:
+        s = QEv2(sell_confirm_min=sc)
+        buys, sells, _, _ = s.compute(df)
+        r = measure_accuracy(df, buys, sells)
+        print_result(f"SellConfirm>={sc}", r)
 
-    # 8) Combined Best Conservative
-    print(f"\n  ── COMBINED CONSERVATIVE CONFIGURATIONS ──")
-    print(f"  {'Label':>30}  {'Trades':>6}  {'WR%':>6}  {'PF':>6}  {'Return%':>10}  {'DD%':>6}  {'BuyHit%':>8}")
+    # ── 8. Combined configs ──
+    print(f"\n  ── COMBINED CONFIGURATIONS ──")
+    print(f"  {'Config':>30}  {'B(str)':>8}  {'5d':>6}  {'13d':>7}  {'26d':>7}  {'52d':>7}  {'S(str)':>8}  {'dip3%':>6}")
     combos = [
-        ("Default", dict()),
-        ("Conservative A (T70,C10)", dict(buy_threshold=70, sell_threshold=70, signal_cooldown=10)),
-        ("Conservative B (T75,C10)", dict(buy_threshold=75, sell_threshold=75, signal_cooldown=10)),
-        ("Conservative C (T70,C15)", dict(buy_threshold=70, sell_threshold=70, signal_cooldown=15)),
-        ("Ultra Cons (T80,C20)", dict(buy_threshold=80, sell_threshold=80, signal_cooldown=20)),
-        ("RSI Tight (T70,RSI30/70,C10)", dict(buy_threshold=70, sell_threshold=70, rsi_buy_level=30, rsi_sell_level=70, signal_cooldown=10)),
-        ("Long EMA (T70,EMA200,C10)", dict(buy_threshold=70, sell_threshold=70, ema_length=200, signal_cooldown=10)),
-        ("Squeeze Heavy (T70,Sq40,C10)", dict(buy_threshold=70, sell_threshold=70, squeeze_weight=40, rsi_weight=15, trend_weight=15, volume_weight=15, adx_weight=15, signal_cooldown=10)),
-        ("High Conf (T70,Conf3,C10)", dict(buy_threshold=70, sell_threshold=70, confirmation_bars=3, signal_cooldown=10)),
-        ("Best Mix (T70,RSI30/70,EMA200,C10)", dict(buy_threshold=70, sell_threshold=70, rsi_buy_level=30, rsi_sell_level=70, ema_length=200, signal_cooldown=10)),
+        ("Default", {}),
+        ("Tight Confirm", dict(buy_confirm_min=3, sell_confirm_min=3)),
+        ("Deep Pullback", dict(pullback_pct=10, buy_confirm_min=2)),
+        ("Loose Pullback", dict(pullback_pct=3, buy_confirm_min=2)),
+        ("Max Quality", dict(pullback_pct=7, buy_confirm_min=3, sell_confirm_min=3, buy_cooldown=15, sell_cooldown=25)),
+        ("Frequent Buys", dict(pullback_pct=3, buy_confirm_min=1, buy_cooldown=5)),
+        ("RSI Tight", dict(rsi_oversold=25, rsi_recovery=30, rsi_overbought=75, rsi_exhaustion=70)),
+        ("Long SMA", dict(sma_slow=250, pullback_pct=5)),
+        ("Short SMA", dict(sma_slow=150, pullback_pct=5)),
+        ("High Conviction", dict(pullback_pct=7, buy_confirm_min=3, sell_confirm_min=2, buy_cooldown=20, sell_cooldown=20)),
+        ("Balanced", dict(pullback_pct=5, buy_confirm_min=2, sell_confirm_min=2, buy_cooldown=10, sell_cooldown=15)),
     ]
     for label, kwargs in combos:
-        s = QuantumEdgeStrategy(**kwargs)
-        sigs, _, _ = s.compute_signals(df)
-        r = backtest(df, sigs)
-        marker = " ★" if r['trades'] >= 5 and r['buy_hit_13'] >= 60 and r['win_rate'] >= 50 else ""
-        print(f"  {label:>30}  {r['trades']:>6}  {r['win_rate']:>5.1f}%  {r['profit_factor']:>5.2f}  "
-              f"{r['return_pct']:>9.1f}%  {r['max_dd']:>5.1f}%  {r['buy_hit_13']:>7.1f}%{marker}")
+        s = QEv2(**kwargs)
+        buys, sells, _, _ = s.compute(df)
+        r = measure_accuracy(df, buys, sells)
+        print_result(label, r)
+
+    # ── 9. Best config detailed breakdown ──
+    print(f"\n  ── DETAILED ACCURACY (Default config) ──")
+    s = QEv2()
+    buys, sells, _, _ = s.compute(df)
+    r = measure_accuracy(df, buys, sells)
+    print(f"  BUY  All ({r['BUY_total']:>3}):   5d={r['BUY_acc_5']:.0f}%  13d={r['BUY_acc_13']:.0f}%  26d={r['BUY_acc_26']:.0f}%  52d={r['BUY_acc_52']:.0f}%  |  Avg ret: 5d={r['BUY_ret_5']:>+.2f}%  13d={r['BUY_ret_13']:>+.2f}%  26d={r['BUY_ret_26']:>+.2f}%  52d={r['BUY_ret_52']:>+.2f}%")
+    print(f"  BUY  Str ({r['BUY_strong']:>3}):   5d={r.get('BUY_strong_acc_5',0):.0f}%  13d={r.get('BUY_strong_acc_13',0):.0f}%  26d={r.get('BUY_strong_acc_26',0):.0f}%  52d={r.get('BUY_strong_acc_52',0):.0f}%")
+    print(f"  SELL All ({r['SELL_total']:>3}):   5d={r['SELL_acc_5']:.0f}%  13d={r['SELL_acc_13']:.0f}%  26d={r['SELL_acc_26']:.0f}%  52d={r['SELL_acc_52']:.0f}%  |  Dip>=3%: 13d={r.get('SELL_dip3_13',0):.0f}%  26d={r.get('SELL_dip3_26',0):.0f}%  52d={r.get('SELL_dip3_52',0):.0f}%")
+    print(f"  SELL Str ({r['SELL_strong']:>3}):   5d={r.get('SELL_strong_acc_5',0):.0f}%  13d={r.get('SELL_strong_acc_13',0):.0f}%  26d={r.get('SELL_strong_acc_26',0):.0f}%  52d={r.get('SELL_strong_acc_52',0):.0f}%")
+
+    # Show signal dates for inspection
+    buy_dates = df.index[buys.values > 0]
+    sell_dates = df.index[sells.values > 0]
+    print(f"\n  Recent Buy signals: {[d.strftime('%Y-%m-%d') for d in buy_dates[-8:]]}")
+    print(f"  Recent Sell signals: {[d.strftime('%Y-%m-%d') for d in sell_dates[-5:]]}")
 
 
-# ═══════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════
+def main():
+    print("="*95)
+    print("  QUANTUM EDGE v2 — EVENT-BASED HIGH-CONFIDENCE BACKTEST")
+    print("  Independent buy/sell — buy-focused — rare high-conviction sells")
+    print("="*95)
+    print("\nLoading data...")
+
+    datasets = [
+        ('/home/user/Rockstar-Indicator/data/BTC-USD_daily.csv', 'BTC-USD'),
+        ('/home/user/Rockstar-Indicator/data/SPY_daily.csv', 'MGK (SPY proxy)'),
+    ]
+
+    for path, name in datasets:
+        df = load_data(path, name)
+        if df is not None and len(df) >= 300:
+            sweep(df, name)
+
+    print(f"\n  NOTE: Colonial Coal (CAD.V) — no public data source found.")
+    print(f"  Export from TradingView → Save as data/CADV_daily.csv to include.")
+
+    print(f"\n{'='*95}")
+    print("  ★ = Buy 13d accuracy >= 65%   ★★ = Buy 26d accuracy >= 70%")
+    print(f"{'='*95}")
+
 
 def load_data(filepath, name):
     try:
@@ -515,27 +530,8 @@ def load_data(filepath, name):
         print(f"  {name}: {len(df)} bars ({df.index[0].strftime('%Y-%m-%d')} to {df.index[-1].strftime('%Y-%m-%d')})")
         return df
     except Exception as e:
-        print(f"  ERROR: {e}")
+        print(f"  {name}: ERROR — {e}")
         return None
-
-
-def main():
-    print("="*75)
-    print("  QUANTUM EDGE — PARAMETER OPTIMIZATION FOR CONSERVATIVE TIMING")
-    print("="*75)
-    print("\nLoading data...")
-
-    btc = load_data('/home/user/Rockstar-Indicator/data/BTC-USD_daily.csv', 'BTC-USD')
-    spy = load_data('/home/user/Rockstar-Indicator/data/SPY_daily.csv', 'SPY')
-
-    if btc is not None and len(btc) >= 300:
-        sweep(btc, 'BTC-USD')
-    if spy is not None and len(spy) >= 300:
-        sweep(spy, 'SPY')
-
-    print(f"\n{'='*75}")
-    print("  SWEEP COMPLETE — Look for ★ markers on best conservative configs")
-    print(f"{'='*75}")
 
 
 if __name__ == '__main__':
