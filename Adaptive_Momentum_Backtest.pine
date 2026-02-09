@@ -536,7 +536,7 @@ if barstate.islast
     buyHitRate  = buyTotalN > 0 ? buyCorrectN * 100.0 / buyTotalN : na
     sellHitRate = sellTotalN > 0 ? sellCorrectN * 100.0 / sellTotalN : na
 
-    var table stats = table.new(position.bottom_right, 3, 24,
+    var table stats = table.new(position.bottom_right, 3, 25,
                                 bgcolor = color.new(#0D1117, 5),
                                 border_width = 1,
                                 border_color = color.new(#30363D, 0))
