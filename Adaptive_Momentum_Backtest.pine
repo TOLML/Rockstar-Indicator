@@ -48,12 +48,7 @@ sensitivityInput = input.string("4 — Standard", "Signal Sensitivity",
      group = "Sensitivity",
      tooltip = "1 = Fewest signals, highest conviction\n4 = Default balanced\n7 = Most signals, lowest threshold")
 
-sensLevel = sensitivityInput == "1 — Ultra Conservative" ? 1 :
-            sensitivityInput == "2 — Conservative" ? 2 :
-            sensitivityInput == "3 — Moderate" ? 3 :
-            sensitivityInput == "4 — Standard" ? 4 :
-            sensitivityInput == "5 — Responsive" ? 5 :
-            sensitivityInput == "6 — Aggressive" ? 6 : 7
+sensLevel = sensitivityInput == "1 — Ultra Conservative" ? 1 : sensitivityInput == "2 — Conservative" ? 2 : sensitivityInput == "3 — Moderate" ? 3 : sensitivityInput == "4 — Standard" ? 4 : sensitivityInput == "5 — Responsive" ? 5 : sensitivityInput == "6 — Aggressive" ? 6 : 7
 
 // Sensitivity multipliers
 sensThreshMult   = sensLevel == 1 ? 1.6 : sensLevel == 2 ? 1.3 : sensLevel == 3 ? 1.15 : sensLevel == 4 ? 1.0 : sensLevel == 5 ? 0.85 : sensLevel == 6 ? 0.72 : 0.6
@@ -196,8 +191,7 @@ obvScore = obvSlope ? 1.0 : (obvEma5 < obvEma20 ? -0.5 : 0.0)
 cmfScore = cmf21 > 0.05 ? 1.0 : (cmf21 > 0 ? 0.5 : (cmf21 > -0.05 ? -0.25 : -1.0))
 
 // Volume confirmation bonus
-volConfirmScore = volSpike and close > close[1] ? 0.5 :
-                  volSpike and close < close[1] ? -0.5 : 0.0
+volConfirmScore = volSpike and close > close[1] ? 0.5 : volSpike and close < close[1] ? -0.5 : 0.0
 
 // ATR regime contribution (low vol = favorable, high vol = cautious)
 atrScore = volRegimeLow ? 0.5 : (volRegimeHigh ? -0.5 : 0.0)
@@ -271,12 +265,7 @@ scoreEma6 = ta.ema(rawScoreClamped, 6)
 scoreEma7 = ta.ema(rawScoreClamped, 7)
 
 // Select the correct pre-computed EMA based on runtime period
-compositeScore = scoreSmoothPeriod <= 1 ? rawScoreClamped :
-                 scoreSmoothPeriod == 2 ? scoreEma2 :
-                 scoreSmoothPeriod == 3 ? scoreEma3 :
-                 scoreSmoothPeriod == 4 ? scoreEma4 :
-                 scoreSmoothPeriod == 5 ? scoreEma5 :
-                 scoreSmoothPeriod == 6 ? scoreEma6 : scoreEma7
+compositeScore = scoreSmoothPeriod <= 1 ? rawScoreClamped : scoreSmoothPeriod == 2 ? scoreEma2 : scoreSmoothPeriod == 3 ? scoreEma3 : scoreSmoothPeriod == 4 ? scoreEma4 : scoreSmoothPeriod == 5 ? scoreEma5 : scoreSmoothPeriod == 6 ? scoreEma6 : scoreEma7
 compositeScore := math.max(0.0, math.min(10.0, compositeScore))
 
 // ═══════════════════════════════════════════
@@ -692,11 +681,7 @@ if barstate.islast
 // ═══════════════════════════════════════════
 
 // Zone background color
-zoneBgColor = isStrongBuy ? color.new(#3FB950, 92) :
-              isAccumulate ? color.new(#2EA043, 94) :
-              isHold ? color.new(#D29922, 95) :
-              isDistribute ? color.new(#DA3633, 94) :
-              color.new(#F85149, 92)
+zoneBgColor = isStrongBuy ? color.new(#3FB950, 92) : isAccumulate ? color.new(#2EA043, 94) : isHold ? color.new(#D29922, 95) : isDistribute ? color.new(#DA3633, 94) : color.new(#F85149, 92)
 bgcolor(zoneBgColor, title = "Zone Background")
 
 // Signal markers
