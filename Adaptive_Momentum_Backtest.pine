@@ -1,7 +1,10 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// ADAPTIVE MOMENTUM v4.1 — HIERARCHICAL MULTI-LAYER SIGNAL SYSTEM
+// ADAPTIVE MOMENTUM v4.2 — LONG-TERM TIMING SIGNAL SYSTEM
 // PineScript: v6
 // ═══════════════════════════════════════════════════════════════════════════════
+//
+// PURPOSE: Time long-term buys and sells. Not for active trading — designed
+//   to identify high-conviction entry/exit points for position building.
 //
 // ARCHITECTURE:
 //   3-layer hierarchical filter (NOT naive indicator voting).
@@ -14,26 +17,22 @@
 //             BB Squeeze detection. Composite score 0–10.
 //
 //   Output: 5 actionable zones mapped from composite score.
-//     Strong Buy (8–10), Accumulate (6–8), Hold (4–6),
-//     Distribute (2–4), Strong Sell (0–2).
+//     Strong Buy (8–10)  → High conviction entry
+//     Accumulate (6–8)   → Good entry, scale in
+//     Hold (4–6)         → Maintain existing position
+//     Distribute (2–4)   → Take partial profits
+//     Strong Sell (0–2)  → Full exit
 //
-//   Automatic ATR-normalized adaptation — no asset-type selector needed.
+//   Set up ALERTS: TradingView → Alerts → Select this strategy →
+//     "alert() function calls only" → receive push/email on buy/sell signals.
+//
+//   Automatic ATR-normalized adaptation — works on any asset.
 //   Single user control: 7-level sensitivity preset.
-//
-// v4.1 IMPROVEMENTS (research-validated, A/B tested on BTC + SPY):
-//   Volatility-adaptive score smoothing (auto-scales with asset ATR%)
-//   Zone hysteresis (asymmetric entry/exit thresholds at Sens 4+)
-//   Result: BTC hit rate 58→63%, SPY hit rate 63→66% at default Sens 4
-//
-// REMOVED (redundant / low empirical evidence):
-//   Fisher Transform, MACD (redundant with EMA trend), Stochastic RSI,
-//   Divergence detection, Hurst Exponent, GARCH proxy, Pi Cycle,
-//   Mayer Multiple, asset-specific factor switching.
 //
 // ═══════════════════════════════════════════════════════════════════════════════
 
 //@version=6
-strategy("Adaptive Momentum v4.1 — Backtest", overlay = true,
+strategy("Adaptive Momentum v4.2 — Timing", overlay = true,
          default_qty_type = strategy.percent_of_equity, default_qty_value = 100,
          initial_capital = 100000, commission_type = strategy.commission.percent,
          commission_value = 0.1, slippage = 1, process_orders_on_close = true,
@@ -42,11 +41,11 @@ strategy("Adaptive Momentum v4.1 — Backtest", overlay = true,
 // ═══════════════════════════════════════════
 // § 1 — SENSITIVITY & STRATEGY CONTROLS
 // ═══════════════════════════════════════════
-sensitivityInput = input.string("4 — Standard", "Signal Sensitivity",
+sensitivityInput = input.string("3 — Moderate", "Signal Sensitivity",
      options = ["1 — Ultra Conservative", "2 — Conservative", "3 — Moderate",
                 "4 — Standard", "5 — Responsive", "6 — Aggressive", "7 — Scalper"],
      group = "Sensitivity",
-     tooltip = "1 = Fewest signals, highest conviction\n4 = Default balanced\n7 = Most signals, lowest threshold")
+     tooltip = "For long-term timing: use 2-3 (fewer, higher-conviction signals)\n1 = Fewest signals, highest conviction\n4 = Standard\n7 = Most signals")
 
 sensLevel = sensitivityInput == "1 — Ultra Conservative" ? 1 : sensitivityInput == "2 — Conservative" ? 2 : sensitivityInput == "3 — Moderate" ? 3 : sensitivityInput == "4 — Standard" ? 4 : sensitivityInput == "5 — Responsive" ? 5 : sensitivityInput == "6 — Aggressive" ? 6 : 7
 
@@ -384,7 +383,7 @@ if sellSignal
     barsInTrade     := 0
 
 // ═══════════════════════════════════════════
-// § 8 — STRATEGY EXECUTION
+// § 8 — STRATEGY EXECUTION & ALERTS
 // ═══════════════════════════════════════════
 if buySignal
     strategy.entry("Long", strategy.long)
@@ -396,6 +395,19 @@ if sellSignal
 
 if buySignal and enableShorts
     strategy.close("Short")
+
+// ── ALERTS: Set TradingView alert → "alert() function calls only" ──
+zoneStr = isStrongBuy ? "STRONG BUY" : isAccumulate ? "ACCUMULATE" : isHold ? "HOLD" : isDistribute ? "DISTRIBUTE" : "STRONG SELL"
+if buySignal
+    alert("BUY SIGNAL — " + syminfo.ticker + " — Zone: " + zoneStr + " — Score: " + str.tostring(compositeScore, "#.1") + " — Price: " + str.tostring(close), alert.freq_once_per_bar)
+if sellSignal
+    alert("SELL SIGNAL — " + syminfo.ticker + " — Zone: " + zoneStr + " — Score: " + str.tostring(compositeScore, "#.1") + " — Price: " + str.tostring(close), alert.freq_once_per_bar)
+
+// ── CHART LABELS: BUY/SELL with price on chart ──
+if buySignal
+    label.new(bar_index, low, "BUY @ " + str.tostring(close, format.mintick), style = label.style_label_up, color = color.new(#3FB950, 10), textcolor = color.white, size = size.normal)
+if sellSignal
+    label.new(bar_index, high, "SELL @ " + str.tostring(close, format.mintick), style = label.style_label_down, color = color.new(#F85149, 10), textcolor = color.white, size = size.normal)
 
 // ═══════════════════════════════════════════
 // § 9 — FORWARD RETURN TRACKING
@@ -536,7 +548,7 @@ if barstate.islast
     buyHitRate  = buyTotalN > 0 ? buyCorrectN * 100.0 / buyTotalN : na
     sellHitRate = sellTotalN > 0 ? sellCorrectN * 100.0 / sellTotalN : na
 
-    var table stats = table.new(position.bottom_right, 3, 24,
+    var table stats = table.new(position.bottom_right, 3, 25,
                                 bgcolor = color.new(#0D1117, 5),
                                 border_width = 1,
                                 border_color = color.new(#30363D, 0))
@@ -685,9 +697,9 @@ if barstate.islast
 zoneBgColor = isStrongBuy ? color.new(#3FB950, 92) : isAccumulate ? color.new(#2EA043, 94) : isHold ? color.new(#D29922, 95) : isDistribute ? color.new(#DA3633, 94) : color.new(#F85149, 92)
 bgcolor(zoneBgColor, title = "Zone Background")
 
-// Signal markers
-plotshape(buySignal,  title = "Buy Signal",  style = shape.triangleup,   location = location.belowbar, color = color.new(#3FB950, 0), size = size.small)
-plotshape(sellSignal, title = "Sell Signal", style = shape.triangledown, location = location.abovebar, color = color.new(#F85149, 0), size = size.small)
+// Signal markers (large for 5Y chart visibility)
+plotshape(buySignal,  title = "Buy Signal",  style = shape.triangleup,   location = location.belowbar, color = color.new(#3FB950, 0), size = size.large, text = "BUY")
+plotshape(sellSignal, title = "Sell Signal", style = shape.triangledown, location = location.abovebar, color = color.new(#F85149, 0), size = size.large, text = "SELL")
 
 // Trend gate line
 plot(sma200, title = "200 SMA (Trend Gate)", color = trendGatePass ? color.new(#3FB950, 50) : color.new(#F85149, 50), linewidth = 2)
@@ -695,6 +707,3 @@ plot(sma200, title = "200 SMA (Trend Gate)", color = trendGatePass ? color.new(#
 // Supertrend trailing stop
 plot(stBullish ? stValue : na, title = "Supertrend Bull", color = color.new(#3FB950, 70), style = plot.style_linebr, linewidth = 1)
 plot(stBearish ? stValue : na, title = "Supertrend Bear", color = color.new(#F85149, 70), style = plot.style_linebr, linewidth = 1)
-
-// Volume warning
-plotshape(lowVolumeEnv and not lowVolumeEnv[1], title = "Low Volume Warning", style = shape.xcross, location = location.abovebar, color = color.new(#D29922, 30), size = size.tiny)
